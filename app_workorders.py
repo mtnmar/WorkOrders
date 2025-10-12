@@ -1,11 +1,11 @@
-# app_workorders.py
+# app_workorders_excel.py
 # --------------------------------------------------------------
-# SPF Work Orders portal
+# SPF Work Orders portal (reads Excel directly to keep original order)
 # - Login (streamlit-authenticator)
 # - Authorize by Location
-# - Required selection flow: Location -> Asset (searchable dropdowns)
-# - Table = history for selected Asset at selected Location
-# - Preserves DB/view order; displays COMPLETED ON as date-only
+# - Choose Location -> Asset from Asset_Master (unique lists)
+# - Table shows history for that asset in EXACT Excel row order
+# - COMPLETED ON displayed as date-only (no reordering)
 # - Downloads: Excel (.xlsx) and Word (.docx)
 #
 # requirements.txt (minimum):
@@ -19,17 +19,20 @@
 #   requests>=2.31
 
 from __future__ import annotations
-import os, io, sqlite3, textwrap
+import io, textwrap
 from pathlib import Path
 from collections.abc import Mapping
 from datetime import datetime, timezone
+
 import pandas as pd
 import streamlit as st
 import yaml
 
 APP_VERSION = "2025.10.12"
+SHEET_WORKORDERS = "Workorders"
+SHEET_ASSET_MASTER = "Asset_Master"
 
-# ---- deps ----
+# ---------- deps ----------
 try:
     import streamlit_authenticator as stauth
 except Exception:
@@ -45,9 +48,7 @@ except Exception:
 
 st.set_page_config(page_title="SPF Work Orders", page_icon="🛠️", layout="wide")
 
-# ---------- Defaults & config ----------
-DEFAULT_DB = "maintainx_workorders.db"  # local fallback; Cloud uses secrets→GitHub
-
+# ---------- config template ----------
 CONFIG_TEMPLATE_YAML = """
 credentials:
   usernames:
@@ -64,51 +65,34 @@ cookie:
 access:
   admin_usernames: [demo]
   user_locations:
-    demo: ['*']    # '*' = all locations
+    demo: ['*']
 
 settings:
-  db_path: ""
+  db_path: ""    # unused here (we read Excel directly via secrets->github)
 """
-
-HERE = Path(__file__).resolve().parent
 
 # ---------- helpers ----------
 def to_plain(obj):
-    """Recursively convert Secrets to plain Python structures."""
     if isinstance(obj, Mapping):
         return {k: to_plain(v) for k, v in obj.items()}
     if isinstance(obj, (list, tuple)):
         return [to_plain(x) for x in obj]
     return obj
 
-def resolve_db_path(cfg: dict) -> str:
-    # 1) YAML/secrets-configured path
-    yaml_db = (cfg or {}).get('settings', {}).get('db_path')
-    if yaml_db:
-        return yaml_db
-    # 2) SPF_DB_PATH env
-    env_db = os.environ.get('SPF_DB_PATH')
-    if env_db:
-        return env_db
-    # 3) Secrets → GitHub download (supports private repo)
-    gh = st.secrets.get('github') if hasattr(st, 'secrets') else None
-    if gh:
+def load_config() -> dict:
+    if "app_config" in st.secrets:
+        return to_plain(st.secrets["app_config"])
+    if "app_config_yaml" in st.secrets:
         try:
-            return download_db_from_github(
-                repo=gh.get('repo'),
-                path=gh.get('path'),
-                branch=gh.get('branch', 'main'),
-                token=gh.get('token'),
-            )
+            return yaml.safe_load(st.secrets["app_config_yaml"]) or {}
         except Exception as e:
-            st.error(f"Failed to download DB from GitHub: {e}")
-    # 4) Fallback local
-    return DEFAULT_DB
+            st.error(f"Invalid YAML in app_config_yaml secret: {e}")
+            return {}
+    return yaml.safe_load(CONFIG_TEMPLATE_YAML)
 
-def download_db_from_github(*, repo: str, path: str, branch: str = 'main', token: str | None = None) -> str:
-    if not repo or not path:
-        raise ValueError("Missing repo/path for GitHub download.")
-    import requests, tempfile
+@st.cache_data(show_spinner=False)
+def download_excel_from_github(repo: str, path: str, branch: str, token: str|None) -> bytes:
+    import requests
     url = f"https://api.github.com/repos/{repo}/contents/{path}?ref={branch}"
     headers = {"Accept": "application/vnd.github.v3.raw"}
     if token:
@@ -116,37 +100,89 @@ def download_db_from_github(*, repo: str, path: str, branch: str = 'main', token
     r = requests.get(url, headers=headers, timeout=30)
     if r.status_code != 200:
         raise RuntimeError(f"GitHub API returned {r.status_code}: {r.text[:200]}")
-    tmpdir = Path(tempfile.gettempdir()) / "spf_wo_cache"
-    tmpdir.mkdir(parents=True, exist_ok=True)
-    out = tmpdir / "maintainx_workorders.db"
-    out.write_bytes(r.content)
-    return str(out)
-
-def load_config() -> dict:
-    if "app_config" in st.secrets:           # TOML secrets (recommended)
-        return to_plain(st.secrets["app_config"])
-    if "app_config_yaml" in st.secrets:       # legacy YAML in secrets
-        try:
-            return yaml.safe_load(st.secrets["app_config_yaml"]) or {}
-        except Exception as e:
-            st.error(f"Invalid YAML in app_config_yaml secret: {e}")
-            return {}
-    cfg_file = HERE / "app_config.yaml"       # local file for dev
-    if cfg_file.exists():
-        try:
-            return yaml.safe_load(cfg_file.read_text(encoding="utf-8")) or {}
-        except Exception as e:
-            st.error(f"Invalid YAML in app_config.yaml: {e}")
-            return {}
-    return yaml.safe_load(CONFIG_TEMPLATE_YAML)
+    return r.content
 
 @st.cache_data(show_spinner=False)
-def q(sql: str, params: tuple = (), db_path: str | None = None) -> pd.DataFrame:
-    path = db_path or DEFAULT_DB
-    with sqlite3.connect(path) as conn:
-        return pd.read_sql_query(sql, conn, params=params)
+def get_data_last_updated_from_github(repo: str, path: str, branch: str, token: str|None) -> str|None:
+    import requests
+    url = f"https://api.github.com/repos/{repo}/commits"
+    params = {"path": path, "per_page": 1, "sha": branch}
+    headers = {"Accept": "application/vnd.github+json"}
+    if token:
+        headers["Authorization"] = f"token {token}"
+    try:
+        r = requests.get(url, headers=headers, params=params, timeout=20)
+        r.raise_for_status()
+        iso = r.json()[0]["commit"]["committer"]["date"]
+        dt = datetime.fromisoformat(iso.replace("Z", "+00:00")).astimezone(timezone.utc)
+        return dt.strftime("Data last updated: %Y-%m-%d %H:%M UTC")
+    except Exception:
+        return None
 
-# ---- SAFE Excel export (works even when df is empty) ----
+@st.cache_data(show_spinner=False)
+def load_workorders_df(xlsx_bytes: bytes, sheet_name: str) -> pd.DataFrame:
+    """Read Workorders as strings; KEEP ORIGINAL ROW ORDER. No sorting."""
+    df = pd.read_excel(
+        io.BytesIO(xlsx_bytes),
+        sheet_name=sheet_name,
+        dtype=str,
+        keep_default_na=False,
+        engine="openpyxl",
+    )
+    df.columns = [str(c).strip() for c in df.columns]
+    df["_EXCEL_ORDER"] = range(1, len(df) + 1)  # stabilizer if ever needed
+    return df
+
+@st.cache_data(show_spinner=False)
+def load_asset_master_df(xlsx_bytes: bytes, sheet_name: str) -> pd.DataFrame:
+    """Read Asset_Master; expect columns Location + ASSET (or Asset)."""
+    df = pd.read_excel(
+        io.BytesIO(xlsx_bytes),
+        sheet_name=sheet_name,
+        dtype=str,
+        keep_default_na=False,
+        engine="openpyxl",
+    )
+    df.columns = [str(c).strip() for c in df.columns]
+    # Normalize column names
+    col_map = {c.casefold(): c for c in df.columns}
+    loc_col = col_map.get("location", None)
+    asset_col = col_map.get("asset", None) or col_map.get("asset ", None) or col_map.get("as set", None)
+    if asset_col is None and "ASSET" in df.columns:
+        asset_col = "ASSET"
+    if asset_col is None and "Asset" in df.columns:
+        asset_col = "Asset"
+    if loc_col is None:  # try exact
+        loc_col = "Location"
+    if asset_col is None:
+        asset_col = "ASSET"
+
+    missing = [c for c in (loc_col, asset_col) if c not in df.columns]
+    if missing:
+        raise ValueError(f"Asset_Master is missing required column(s): {missing}. Found: {list(df.columns)}")
+
+    # Keep only needed columns in original row order; ensure names Location/ASSET
+    df = df[[loc_col, asset_col]].copy()
+    if loc_col != "Location":
+        df.rename(columns={loc_col: "Location"}, inplace=True)
+    if asset_col != "ASSET":
+        df.rename(columns={asset_col: "ASSET"}, inplace=True)
+
+    # Strip whitespace in cells
+    for c in ("Location", "ASSET"):
+        df[c] = df[c].map(lambda x: x.strip() if isinstance(x, str) else x)
+
+    return df
+
+def unique_first_seen(series: pd.Series) -> list[str]:
+    seen = set()
+    out = []
+    for v in series:
+        if v not in seen and v not in ("", None):
+            seen.add(v)
+            out.append(v)
+    return out
+
 def to_xlsx_bytes(df: pd.DataFrame, sheet: str) -> bytes:
     import xlsxwriter
     buf = io.BytesIO()
@@ -155,14 +191,10 @@ def to_xlsx_bytes(df: pd.DataFrame, sheet: str) -> bytes:
         ws = w.sheets[sheet]
         ws.autofilter(0, 0, max(0, len(df)), max(0, len(df.columns) - 1))
         for i, col in enumerate(df.columns):
-            if df.empty:
-                width = 12
-            else:
-                lens = df[col].astype(str).str.len()
-                qv = lens.quantile(0.9) if not lens.empty else 10
-                qv = 10 if pd.isna(qv) else qv
-                width = min(60, max(10, int(qv) + 2))
-            ws.set_column(i, i, width)
+            lens = df[col].astype(str).str.len()
+            qv = lens.quantile(0.9) if not lens.empty else 10
+            qv = 10 if pd.isna(qv) else qv
+            ws.set_column(i, i, min(60, max(10, int(qv) + 2)))
     return buf.getvalue()
 
 def to_docx_bytes(df: pd.DataFrame, title: str) -> bytes:
@@ -183,37 +215,11 @@ def to_docx_bytes(df: pd.DataFrame, title: str) -> bytes:
     doc.save(out)
     return out.getvalue()
 
-# ---- "Data last updated" helper (GitHub commit time or local mtime) ----
-def get_data_last_updated(db_path: str) -> str | None:
-    gh = st.secrets.get('github') if hasattr(st, 'secrets') else None
-    if gh and gh.get('repo') and gh.get('path'):
-        try:
-            import requests
-            url = f"https://api.github.com/repos/{gh['repo']}/commits"
-            params = {"path": gh["path"], "per_page": 1, "sha": gh.get("branch", "main")}
-            headers = {"Accept": "application/vnd.github+json"}
-            if gh.get("token"):
-                headers["Authorization"] = f"token {gh['token']}"
-            r = requests.get(url, headers=headers, params=params, timeout=20)
-            r.raise_for_status()
-            iso = r.json()[0]["commit"]["committer"]["date"]
-            dt = datetime.fromisoformat(iso.replace("Z", "+00:00")).astimezone(timezone.utc)
-            return dt.strftime("Data last updated: %Y-%m-%d %H:%M UTC")
-        except Exception:
-            pass
-    try:
-        ts = Path(db_path).stat().st_mtime
-        dt = datetime.fromtimestamp(ts, tz=timezone.utc)
-        return dt.strftime("Data last updated: %Y-%m-%d %H:%M UTC")
-    except Exception:
-        return None
-
 # ---------- App ----------
 st.sidebar.caption(f"SPF Work Orders — v{APP_VERSION}")
 cfg = load_config()
-cfg = to_plain(cfg)
 
-# Auth (pin streamlit-authenticator==0.2.3)
+# Auth
 cookie_cfg = cfg.get('cookie', {})
 auth = stauth.Authenticate(
     cfg.get('credentials', {}),
@@ -221,7 +227,6 @@ auth = stauth.Authenticate(
     cookie_cfg.get('key',  'super_secret_key_wo'),
     cookie_cfg.get('expiry_days', 7),
 )
-
 name, auth_status, username = auth.login("Login", "main")
 
 if auth_status is False:
@@ -232,23 +237,33 @@ else:
     auth.logout('Logout', 'sidebar')
     st.sidebar.success(f"Logged in as {name}")
 
-    db_path = resolve_db_path(cfg)
+    # GitHub file info
+    gh = st.secrets.get('github') if hasattr(st, 'secrets') else {}
+    repo   = gh.get('repo')
+    path   = gh.get('path')      # must be "Workorders.xlsx"
+    branch = gh.get('branch', 'main')
+    token  = gh.get('token')
 
-    # Sidebar: only the "last updated" info (no DB path)
-    updated_label = get_data_last_updated(db_path)
-    if updated_label:
-        st.sidebar.caption(updated_label)
+    if not (repo and path):
+        st.error("Secrets [github] must include repo, path (Workorders.xlsx).")
+        st.stop()
 
-    if st.sidebar.button("🔄 Refresh data"):
-        st.cache_data.clear()
+    # Download Excel once
+    xlsx_bytes = download_excel_from_github(repo, path, branch, token)
+    last_updated = get_data_last_updated_from_github(repo, path, branch, token)
+    if last_updated:
+        st.sidebar.caption(last_updated)
 
-    # ---- Authorization by Location ----
+    # Load sheets (keep original row orders)
+    df_all = load_workorders_df(xlsx_bytes, SHEET_WORKORDERS)
+    df_master = load_asset_master_df(xlsx_bytes, SHEET_ASSET_MASTER)
+
+    # Authorization by Location (case-insensitive)
     username_ci = str(username).casefold()
     admin_users_raw = (cfg.get('access', {}).get('admin_usernames', []) or [])
     admin_users_ci = {str(u).casefold() for u in admin_users_raw}
     is_admin = username_ci in admin_users_ci
 
-    # Case-insensitive lookup of user_locations
     ul_raw = (cfg.get('access', {}).get('user_locations', {}) or {})
     ul_ci_map = {str(k).casefold(): v for k, v in ul_raw.items()}
     allowed_cfg = ul_ci_map.get(username_ci, [])
@@ -259,99 +274,86 @@ else:
     def norm(s: str) -> str:
         return " ".join(str(s).strip().split()).casefold()
 
-    # Pull all distinct Locations present
-    loc_df = q("SELECT DISTINCT [Location] FROM [vw_workorders_by_workorder] WHERE [Location] IS NOT NULL AND [Location] <> '' ORDER BY 1", db_path=db_path)
-    all_locations = [str(x) for x in loc_df['Location'].dropna().tolist()]
-
-    db_loc_map = {norm(c): c for c in all_locations}
-    allowed_norm = {norm(a) for a in allowed_cfg}
-    star_granted = any(str(a).strip() == "*" for a in allowed_cfg)
-
-    if is_admin or star_granted:
-        allowed_locations = set(all_locations)
+    # Build unique Location list from Asset_Master (first-seen order)
+    locs_master = unique_first_seen(df_master["Location"]) if "Location" in df_master.columns else []
+    if is_admin or any(str(a).strip() == "*" for a in allowed_cfg):
+        allowed_locations = locs_master
     else:
-        matches = {db_loc_map[n] for n in allowed_norm if n in db_loc_map}
-        allowed_locations = matches if matches else set(allowed_cfg)  # show configured names even if no rows now
+        allowed_norm = {norm(a) for a in allowed_cfg}
+        allowed_locations = [L for L in locs_master if norm(L) in allowed_norm]
 
     if not allowed_locations:
         st.error("No locations configured for your account. Ask an admin to update your access.")
-        with st.expander("Locations present in DB"):
-            st.write(sorted(all_locations))
+        with st.expander("Locations in Asset_Master"):
+            st.write(locs_master)
         st.stop()
 
-    # ---- UI: Location then Asset (both required, searchable) ----
-    loc_choice = st.sidebar.selectbox(
-        "Choose Location",
-        options=["— Choose location —"] + sorted(allowed_locations),
-        index=0,
-    )
+    # UI: Location -> Asset (both required), from Asset_Master only
+    loc_choice = st.sidebar.selectbox("Choose Location", options=["— Choose location —"] + allowed_locations, index=0)
     if loc_choice == "— Choose location —":
         st.info("Select a Location on the left.")
         st.stop()
 
-    # Assets present at chosen location (unique)
-    asset_df = q(
-        "SELECT DISTINCT [ASSET] FROM [vw_workorders_by_workorder] WHERE [Location] = ? AND [ASSET] IS NOT NULL AND [ASSET] <> '' ORDER BY 1",
-        (loc_choice,), db_path=db_path
-    )
-    assets = [str(x) for x in asset_df['ASSET'].dropna().tolist()]
-    if not assets:
-        st.warning("No assets found for that Location.")
+    df_assets_for_loc = df_master[df_master["Location"] == loc_choice]
+    assets_for_loc = unique_first_seen(df_assets_for_loc["ASSET"]) if "ASSET" in df_assets_for_loc.columns else []
+    if not assets_for_loc:
+        st.warning("No assets listed for that Location in Asset_Master.")
         st.stop()
 
-    asset_choice = st.sidebar.selectbox(
-        "Choose Asset",
-        options=["— Choose asset —"] + assets,
-        index=0,
-    )
+    asset_choice = st.sidebar.selectbox("Choose Asset", options=["— Choose asset —"] + assets_for_loc, index=0)
     if asset_choice == "— Choose asset —":
         st.info("Select an Asset on the left.")
         st.stop()
 
-    # Optional quick search across TITLE / PO / P/N
+    # Optional search (does NOT change order)
     search = st.sidebar.text_input('Search Title / PO / P/N (optional)')
 
-    # ---- Query records for the chosen pair (keeps view order) ----
-    where = ["[Location] = ?", "[ASSET] = ?"]
-    params: list = [loc_choice, asset_choice]
-
+    # Filter rows (preserve Excel order) using Workorders sheet
+    mask = (df_all.get("Location", "") == loc_choice) & (df_all.get("ASSET", "") == asset_choice)
     if search:
-        like = f"%{search}%"
-        where.append("([TITLE] LIKE ? OR [PO] LIKE ? OR [P/N] LIKE ?)")
-        params += [like, like, like]
+        like = str(search).strip().casefold()
+        def match_any(row):
+            return any(like in str(row.get(col, "")).casefold() for col in ("TITLE","PO","P/N"))
+        mask = mask & df_all.apply(match_any, axis=1)
 
-    sql = f"SELECT * FROM [vw_workorders_by_workorder] WHERE {' AND '.join(where)}"
-    df = q(sql, tuple(params), db_path=db_path)
+    df = df_all[mask].copy()  # keeps original row order
 
-    # ---- Display tweaks ----
-    # Show COMPLETED ON as date-only; keep order as-is
+    # Display tweak: COMPLETED ON => date-only string
     if "COMPLETED ON" in df.columns:
-        dt = pd.to_datetime(df["COMPLETED ON"], errors="coerce", utc=False)
+        dt = pd.to_datetime(df["COMPLETED ON"], errors="coerce")
         df["COMPLETED ON"] = dt.dt.date.astype(str).where(dt.notna(), "")
+
+    # Hide helper column
+    if "_EXCEL_ORDER" in df.columns:
+        df.drop(columns=["_EXCEL_ORDER"], inplace=True)
 
     title_txt = f"{loc_choice} — {asset_choice}"
     st.markdown(f"### Work Orders — {title_txt}")
     st.dataframe(df, use_container_width=True, hide_index=True)
 
-    # Downloads (use the exact same df)
+    # Downloads (use displayed df)
+    def _xlsx_bytes(dfx): return to_xlsx_bytes(dfx, sheet="WorkOrders")
+    def _docx_bytes(dfx): return to_docx_bytes(dfx, title=f"Work Orders — {title_txt}")
+
     c1, c2, _ = st.columns([1, 1, 3])
     with c1:
         st.download_button(
             label='⬇️ Excel (.xlsx)',
-            data=to_xlsx_bytes(df, sheet="WorkOrders"),
+            data=_xlsx_bytes(df),
             file_name=f"WorkOrders_{loc_choice}_{asset_choice}.xlsx".replace(" ", "_"),
             mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
         )
     with c2:
         st.download_button(
             label='⬇️ Word (.docx)',
-            data=to_docx_bytes(df, title=f"Work Orders — {title_txt}"),
+            data=_docx_bytes(df),
             file_name=f"WorkOrders_{loc_choice}_{asset_choice}.docx".replace(" ", "_"),
             mime='application/vnd.openxmlformats-officedocument.wordprocessingml.document',
         )
 
-    # Only admins see the config template
+    # Admins: show config template
     if is_admin:
         with st.expander('ℹ️ Config template'):
             st.code(textwrap.dedent(CONFIG_TEMPLATE_YAML).strip(), language='yaml')
+
 
