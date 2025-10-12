@@ -1,40 +1,22 @@
 # app_workorders.py
 # --------------------------------------------------------------
-# Work Orders portal
+# SPF Work Orders portal
 # - Login (streamlit-authenticator)
-# - Authorize & filter by Location
-# - Location -> Asset dropdown (assets are unique within chosen location)
-# - Preserves WO -> PO -> Transaction order via (WORKORDER, Sort)
-# - "Completed Date" shown as date-only (YYYY-MM-DD)
+# - Authorize by Location
+# - Required selection flow: Location -> Asset (searchable dropdowns)
+# - Table = history for selected Asset at selected Location
+# - Preserves DB/view order; displays COMPLETED ON as date-only
 # - Downloads: Excel (.xlsx) and Word (.docx)
 #
-# Secrets expected (recommended TOML form):
-# [app_config.credentials.usernames.YOURUSER]
-# name = "Your Name"
-# email = "you@example.com"
-# password = "bcrypt_hash"
-#
-# [app_config.access]
-# admin_usernames = ["brad"]
-#
-# [app_config.access.user_locations]
-# brad = ["*"]
-# dlauer = ["110 - Deckers Creek Limestone", "240 - Buckeye Stone"]
-#
-# [github]  # optional, for Streamlit Cloud pull of DB
-# repo = "mtnmar/spf-data"
-# path = "maintainx_workorders.db"
-# branch = "main"
-# token = "ghp_..."
-#
-# requirements.txt (minimal):
-# streamlit>=1.37
-# streamlit-authenticator==0.2.3
-# pandas>=2.0
-# xlsxwriter>=3.2
-# python-docx>=1.1
-# pyyaml>=6.0
-# requests>=2.31
+# requirements.txt (minimum):
+#   streamlit>=1.37
+#   streamlit-authenticator==0.2.3
+#   pandas>=2.0
+#   openpyxl>=3.1
+#   xlsxwriter>=3.2
+#   python-docx>=1.1
+#   pyyaml>=6.0
+#   requests>=2.31
 
 from __future__ import annotations
 import os, io, sqlite3, textwrap
@@ -46,8 +28,6 @@ import streamlit as st
 import yaml
 
 APP_VERSION = "2025.10.12"
-DEFAULT_DB = "maintainx_workorders.db"  # local fallback
-TABLE = "workorders"                    # table name in the DB
 
 # ---- deps ----
 try:
@@ -63,83 +43,110 @@ except Exception:
     st.error("python-docx not installed. Add to requirements.txt")
     st.stop()
 
-st.set_page_config(page_title="Work Orders", page_icon="🧰", layout="wide")
+st.set_page_config(page_title="SPF Work Orders", page_icon="🛠️", layout="wide")
+
+# ---------- Defaults & config ----------
+DEFAULT_DB = "maintainx_workorders.db"  # local fallback; Cloud uses secrets→GitHub
+
+CONFIG_TEMPLATE_YAML = """
+credentials:
+  usernames:
+    demo:
+      name: Demo User
+      email: demo@example.com
+      password: "$2b$12$y2J3Y0rRrJ3fA76h2o//mO6F1T0m3b1vS7QhQ4bW5iX9b5b5b5b5e"
+
+cookie:
+  name: spf_wo_portal
+  key: super_secret_key_wo
+  expiry_days: 7
+
+access:
+  admin_usernames: [demo]
+  user_locations:
+    demo: ['*']    # '*' = all locations
+
+settings:
+  db_path: ""
+"""
+
+HERE = Path(__file__).resolve().parent
 
 # ---------- helpers ----------
 def to_plain(obj):
+    """Recursively convert Secrets to plain Python structures."""
     if isinstance(obj, Mapping):
         return {k: to_plain(v) for k, v in obj.items()}
     if isinstance(obj, (list, tuple)):
         return [to_plain(x) for x in obj]
     return obj
 
+def resolve_db_path(cfg: dict) -> str:
+    # 1) YAML/secrets-configured path
+    yaml_db = (cfg or {}).get('settings', {}).get('db_path')
+    if yaml_db:
+        return yaml_db
+    # 2) SPF_DB_PATH env
+    env_db = os.environ.get('SPF_DB_PATH')
+    if env_db:
+        return env_db
+    # 3) Secrets → GitHub download (supports private repo)
+    gh = st.secrets.get('github') if hasattr(st, 'secrets') else None
+    if gh:
+        try:
+            return download_db_from_github(
+                repo=gh.get('repo'),
+                path=gh.get('path'),
+                branch=gh.get('branch', 'main'),
+                token=gh.get('token'),
+            )
+        except Exception as e:
+            st.error(f"Failed to download DB from GitHub: {e}")
+    # 4) Fallback local
+    return DEFAULT_DB
+
+def download_db_from_github(*, repo: str, path: str, branch: str = 'main', token: str | None = None) -> str:
+    if not repo or not path:
+        raise ValueError("Missing repo/path for GitHub download.")
+    import requests, tempfile
+    url = f"https://api.github.com/repos/{repo}/contents/{path}?ref={branch}"
+    headers = {"Accept": "application/vnd.github.v3.raw"}
+    if token:
+        headers["Authorization"] = f"token {token}"
+    r = requests.get(url, headers=headers, timeout=30)
+    if r.status_code != 200:
+        raise RuntimeError(f"GitHub API returned {r.status_code}: {r.text[:200]}")
+    tmpdir = Path(tempfile.gettempdir()) / "spf_wo_cache"
+    tmpdir.mkdir(parents=True, exist_ok=True)
+    out = tmpdir / "maintainx_workorders.db"
+    out.write_bytes(r.content)
+    return str(out)
+
 def load_config() -> dict:
-    if "app_config" in st.secrets:
+    if "app_config" in st.secrets:           # TOML secrets (recommended)
         return to_plain(st.secrets["app_config"])
-    if "app_config_yaml" in st.secrets:
+    if "app_config_yaml" in st.secrets:       # legacy YAML in secrets
         try:
             return yaml.safe_load(st.secrets["app_config_yaml"]) or {}
         except Exception as e:
             st.error(f"Invalid YAML in app_config_yaml secret: {e}")
             return {}
-    cfg_file = Path(__file__).resolve().parent / "app_config.yaml"
+    cfg_file = HERE / "app_config.yaml"       # local file for dev
     if cfg_file.exists():
         try:
             return yaml.safe_load(cfg_file.read_text(encoding="utf-8")) or {}
         except Exception as e:
             st.error(f"Invalid YAML in app_config.yaml: {e}")
             return {}
-    # tiny fallback template
-    return {
-        "cookie": {"name":"wo_portal","key":"change_me","expiry_days":7},
-        "access": {"admin_usernames": [], "user_locations": {}},
-        "settings": {"db_path": ""}
-    }
+    return yaml.safe_load(CONFIG_TEMPLATE_YAML)
 
-def resolve_db_path(cfg: dict) -> str:
-    ydb = (cfg.get("settings") or {}).get("db_path")
-    if ydb:
-        return ydb
-    env = os.environ.get("SPF_DB_PATH")
-    if env:
-        return env
-    gh = st.secrets.get('github') if hasattr(st, 'secrets') else None
-    if gh and gh.get('repo') and gh.get('path'):
-        try:
-            import requests, tempfile
-            url = f"https://api.github.com/repos/{gh['repo']}/contents/{gh['path']}?ref={gh.get('branch','main')}"
-            headers = {"Accept": "application/vnd.github.v3.raw"}
-            if gh.get("token"):
-                headers["Authorization"] = f"token {gh['token']}"
-            r = requests.get(url, headers=headers, timeout=30)
-            if r.status_code != 200:
-                raise RuntimeError(f"GitHub API {r.status_code}: {r.text[:200]}")
-            tmpdir = Path(tempfile.gettempdir()) / "spf_wo_cache"
-            tmpdir.mkdir(parents=True, exist_ok=True)
-            out = tmpdir / "maintainx_workorders.db"
-            out.write_bytes(r.content)
-            return str(out)
-        except Exception as e:
-            st.error(f"GitHub DB fetch failed: {e}")
-    return DEFAULT_DB
-
+@st.cache_data(show_spinner=False)
 def q(sql: str, params: tuple = (), db_path: str | None = None) -> pd.DataFrame:
     path = db_path or DEFAULT_DB
     with sqlite3.connect(path) as conn:
         return pd.read_sql_query(sql, conn, params=params)
 
-def table_columns(db_path: str, table: str) -> list[str]:
-    with sqlite3.connect(db_path) as conn:
-        rows = conn.execute(f"PRAGMA table_info('{table}')").fetchall()
-    return [r[1] for r in rows]
-
-def pick_col(cols: list[str], candidates: list[str]) -> str | None:
-    low = {c.lower(): c for c in cols}
-    for cand in candidates:
-        if cand.lower() in low:
-            return low[cand.lower()]
-    return None
-
+# ---- SAFE Excel export (works even when df is empty) ----
 def to_xlsx_bytes(df: pd.DataFrame, sheet: str) -> bytes:
     import xlsxwriter
     buf = io.BytesIO()
@@ -152,9 +159,9 @@ def to_xlsx_bytes(df: pd.DataFrame, sheet: str) -> bytes:
                 width = 12
             else:
                 lens = df[col].astype(str).str.len()
-                q = lens.quantile(0.9) if not lens.empty else 10
-                q = 10 if pd.isna(q) else q
-                width = min(60, max(10, int(q) + 2))
+                qv = lens.quantile(0.9) if not lens.empty else 10
+                qv = 10 if pd.isna(qv) else qv
+                width = min(60, max(10, int(qv) + 2))
             ws.set_column(i, i, width)
     return buf.getvalue()
 
@@ -176,13 +183,14 @@ def to_docx_bytes(df: pd.DataFrame, title: str) -> bytes:
     doc.save(out)
     return out.getvalue()
 
-def last_updated_label(db_path: str) -> str | None:
+# ---- "Data last updated" helper (GitHub commit time or local mtime) ----
+def get_data_last_updated(db_path: str) -> str | None:
     gh = st.secrets.get('github') if hasattr(st, 'secrets') else None
     if gh and gh.get('repo') and gh.get('path'):
         try:
             import requests
             url = f"https://api.github.com/repos/{gh['repo']}/commits"
-            params = {"path": gh["path"], "per_page": 1, "sha": gh.get("branch","main")}
+            params = {"path": gh["path"], "per_page": 1, "sha": gh.get("branch", "main")}
             headers = {"Accept": "application/vnd.github+json"}
             if gh.get("token"):
                 headers["Authorization"] = f"token {gh['token']}"
@@ -201,13 +209,16 @@ def last_updated_label(db_path: str) -> str | None:
         return None
 
 # ---------- App ----------
+st.sidebar.caption(f"SPF Work Orders — v{APP_VERSION}")
 cfg = load_config()
-cookie_cfg = cfg.get('cookie', {}) or {"name":"wo_portal","key":"change_me","expiry_days":7}
+cfg = to_plain(cfg)
 
+# Auth (pin streamlit-authenticator==0.2.3)
+cookie_cfg = cfg.get('cookie', {})
 auth = stauth.Authenticate(
     cfg.get('credentials', {}),
-    cookie_cfg.get('name', 'wo_portal'),
-    cookie_cfg.get('key',  'change_me'),
+    cookie_cfg.get('name', 'spf_wo_portal'),
+    cookie_cfg.get('key',  'super_secret_key_wo'),
     cookie_cfg.get('expiry_days', 7),
 )
 
@@ -223,133 +234,124 @@ else:
 
     db_path = resolve_db_path(cfg)
 
-    # Sidebar: only show "last updated"
-    lbl = last_updated_label(db_path)
-    if lbl:
-        st.sidebar.caption(lbl)
+    # Sidebar: only the "last updated" info (no DB path)
+    updated_label = get_data_last_updated(db_path)
+    if updated_label:
+        st.sidebar.caption(updated_label)
 
-    # Discover columns in DB so we can adapt to headers
-    cols = table_columns(db_path, TABLE)
-    if not cols:
-        st.error(f"No columns found in table '{TABLE}'.")
-        st.stop()
+    if st.sidebar.button("🔄 Refresh data"):
+        st.cache_data.clear()
 
-    # Find key columns by common names
-    location_col   = pick_col(cols, ["Location", "Company", "Site"])
-    asset_col      = pick_col(cols, ["Asset", "ASSET", "Equipment", "Machine"])
-    wo_col         = pick_col(cols, ["WORKORDER", "Work Order", "WO"])
-    sort_col       = pick_col(cols, ["Sort", "SORT", "Order"])
-    completed_col  = pick_col(cols, ["Completed Date", "COMPLETED DATE", "Date Completed", "Completed"])
-
-    if not location_col or not asset_col or not wo_col:
-        st.error(f"Missing required columns. Need at least Location='{location_col}', Asset='{asset_col}', Work Order='{wo_col}'.")
-        with st.expander("Columns present in table"):
-            st.write(cols)
-        st.stop()
-
-    # Authorization by location (case-insensitive username)
+    # ---- Authorization by Location ----
     username_ci = str(username).casefold()
-    admin_users = [str(u) for u in (cfg.get('access', {}).get('admin_usernames', []) or [])]
-    is_admin = username_ci in {u.casefold() for u in admin_users}
+    admin_users_raw = (cfg.get('access', {}).get('admin_usernames', []) or [])
+    admin_users_ci = {str(u).casefold() for u in admin_users_raw}
+    is_admin = username_ci in admin_users_ci
 
-    # Build allowed location set for this user
-    uc_locs = (cfg.get('access', {}).get('user_locations', {}) or {})
-    # Case-insensitive username lookup
-    uc_ci = {str(k).casefold(): v for k, v in uc_locs.items()}
-    allowed_cfg = uc_ci.get(username_ci, [])
+    # Case-insensitive lookup of user_locations
+    ul_raw = (cfg.get('access', {}).get('user_locations', {}) or {})
+    ul_ci_map = {str(k).casefold(): v for k, v in ul_raw.items()}
+    allowed_cfg = ul_ci_map.get(username_ci, [])
     if isinstance(allowed_cfg, str):
         allowed_cfg = [allowed_cfg]
     allowed_cfg = [a for a in (allowed_cfg or [])]
 
-    # All locations present in table
-    all_locs_df = q(f'SELECT DISTINCT [{location_col}] AS L FROM [{TABLE}] WHERE [{location_col}] IS NOT NULL ORDER BY 1', db_path=db_path)
-    all_locs = [str(x) for x in all_locs_df["L"].dropna().tolist()]
+    def norm(s: str) -> str:
+        return " ".join(str(s).strip().split()).casefold()
 
-    if is_admin or any(str(a).strip() == "*" for a in allowed_cfg):
-        allowed_set = set(all_locs)
+    # Pull all distinct Locations present
+    loc_df = q("SELECT DISTINCT [Location] FROM [vw_workorders_by_workorder] WHERE [Location] IS NOT NULL AND [Location] <> '' ORDER BY 1", db_path=db_path)
+    all_locations = [str(x) for x in loc_df['Location'].dropna().tolist()]
+
+    db_loc_map = {norm(c): c for c in all_locations}
+    allowed_norm = {norm(a) for a in allowed_cfg}
+    star_granted = any(str(a).strip() == "*" for a in allowed_cfg)
+
+    if is_admin or star_granted:
+        allowed_locations = set(all_locations)
     else:
-        # Only those present in DB
-        normalized_all = {s.strip().casefold(): s for s in all_locs}
-        allowed_norm = {" ".join(a.strip().split()).casefold() for a in allowed_cfg}
-        allowed_set = {normalized_all[n] for n in allowed_norm if n in normalized_all}
+        matches = {db_loc_map[n] for n in allowed_norm if n in db_loc_map}
+        allowed_locations = matches if matches else set(allowed_cfg)  # show configured names even if no rows now
 
-        if not allowed_set:
-            # Fallback to showing all (prevents total lockout if mapping is stale)
-            allowed_set = set(all_locs)
-
-    # 1) Choose Location (required)
-    loc_options = ["— Choose location —"] + sorted(allowed_set)
-    loc_choice = st.sidebar.selectbox("Location", options=loc_options, index=0)
-    if loc_choice == "— Choose location —":
-        st.info("Select your Location on the left.")
+    if not allowed_locations:
+        st.error("No locations configured for your account. Ask an admin to update your access.")
+        with st.expander("Locations present in DB"):
+            st.write(sorted(all_locations))
         st.stop()
 
-    # 2) Asset dropdown (unique within chosen location; searchable)
-    assets_df = q(
-        f'SELECT DISTINCT [{asset_col}] AS A FROM [{TABLE}] '
-        f'WHERE [{location_col}] = ? AND [{asset_col}] IS NOT NULL AND TRIM([{asset_col}]) <> "" '
-        f'ORDER BY 1',
+    # ---- UI: Location then Asset (both required, searchable) ----
+    loc_choice = st.sidebar.selectbox(
+        "Choose Location",
+        options=["— Choose location —"] + sorted(allowed_locations),
+        index=0,
+    )
+    if loc_choice == "— Choose location —":
+        st.info("Select a Location on the left.")
+        st.stop()
+
+    # Assets present at chosen location (unique)
+    asset_df = q(
+        "SELECT DISTINCT [ASSET] FROM [vw_workorders_by_workorder] WHERE [Location] = ? AND [ASSET] IS NOT NULL AND [ASSET] <> '' ORDER BY 1",
         (loc_choice,), db_path=db_path
     )
-    assets = [str(x) for x in assets_df["A"].dropna().tolist()]
-
-    asset_choice = st.sidebar.selectbox("Asset", options=(["— Choose asset —"] + assets), index=0)
-    if asset_choice == "— Choose asset —":
-        st.info("Choose an Asset to see its work order history.")
+    assets = [str(x) for x in asset_df['ASSET'].dropna().tolist()]
+    if not assets:
+        st.warning("No assets found for that Location.")
         st.stop()
 
-    # Query rows for this (Location, Asset)
-    where = f'WHERE [{location_col}] = ? AND [{asset_col}] = ?'
-    order = f'ORDER BY [{wo_col}] ASC'
-    if sort_col and sort_col in cols:
-        # numeric-ish ordering for Sort; fallback to text if cast fails
-        order = f'ORDER BY [{wo_col}] ASC, CAST([{sort_col}] AS INTEGER) ASC, ROWID'
+    asset_choice = st.sidebar.selectbox(
+        "Choose Asset",
+        options=["— Choose asset —"] + assets,
+        index=0,
+    )
+    if asset_choice == "— Choose asset —":
+        st.info("Select an Asset on the left.")
+        st.stop()
 
-    sql = f'SELECT * FROM [{TABLE}] {where} {order}'
-    df = q(sql, (loc_choice, asset_choice), db_path=db_path)
+    # Optional quick search across TITLE / PO / P/N
+    search = st.sidebar.text_input('Search Title / PO / P/N (optional)')
 
-    # Show Completed Date as date-only (if present)
-    if completed_col and completed_col in df.columns:
-        d = pd.to_datetime(df[completed_col], errors="coerce", utc=False).dt.date.astype(str)
-        # Keep blanks as "" instead of "NaT"
-        df[completed_col] = d.where(~d.isna(), "")
+    # ---- Query records for the chosen pair (keeps view order) ----
+    where = ["[Location] = ?", "[ASSET] = ?"]
+    params: list = [loc_choice, asset_choice]
 
-    # Title & table
-    st.markdown(f"### Work Order History — {loc_choice} — {asset_choice}")
+    if search:
+        like = f"%{search}%"
+        where.append("([TITLE] LIKE ? OR [PO] LIKE ? OR [P/N] LIKE ?)")
+        params += [like, like, like]
+
+    sql = f"SELECT * FROM [vw_workorders_by_workorder] WHERE {' AND '.join(where)}"
+    df = q(sql, tuple(params), db_path=db_path)
+
+    # ---- Display tweaks ----
+    # Show COMPLETED ON as date-only; keep order as-is
+    if "COMPLETED ON" in df.columns:
+        dt = pd.to_datetime(df["COMPLETED ON"], errors="coerce", utc=False)
+        df["COMPLETED ON"] = dt.dt.date.astype(str).where(dt.notna(), "")
+
+    title_txt = f"{loc_choice} — {asset_choice}"
+    st.markdown(f"### Work Orders — {title_txt}")
     st.dataframe(df, use_container_width=True, hide_index=True)
 
-    # Downloads
+    # Downloads (use the exact same df)
     c1, c2, _ = st.columns([1, 1, 3])
     with c1:
         st.download_button(
             label='⬇️ Excel (.xlsx)',
             data=to_xlsx_bytes(df, sheet="WorkOrders"),
-            file_name=f"WorkOrders_{loc_choice}_{asset_choice}.xlsx",
+            file_name=f"WorkOrders_{loc_choice}_{asset_choice}.xlsx".replace(" ", "_"),
             mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
         )
     with c2:
         st.download_button(
             label='⬇️ Word (.docx)',
-            data=to_docx_bytes(df, title=f"Work Orders — {loc_choice} — {asset_choice}"),
-            file_name=f"WorkOrders_{loc_choice}_{asset_choice}.docx",
+            data=to_docx_bytes(df, title=f"Work Orders — {title_txt}"),
+            file_name=f"WorkOrders_{loc_choice}_{asset_choice}.docx".replace(" ", "_"),
             mime='application/vnd.openxmlformats-officedocument.wordprocessingml.document',
         )
 
-    # Admin-only: config template for quick reference
+    # Only admins see the config template
     if is_admin:
-        CONFIG_TEMPLATE = """
-        [app_config.cookie]
-        name = "wo_portal"
-        key = "change_me"
-        expiry_days = 7
-
-        [app_config.access]
-        admin_usernames = ["brad"]
-
-        [app_config.access.user_locations]
-        brad = ["*"]
-        dlauer = ["110 - Deckers Creek Limestone", "240 - Buckeye Stone"]
-        """
-        with st.expander("ℹ️ Config snippet (TOML)"):
-            st.code(textwrap.dedent(CONFIG_TEMPLATE).strip(), language="toml")
+        with st.expander('ℹ️ Config template'):
+            st.code(textwrap.dedent(CONFIG_TEMPLATE_YAML).strip(), language='yaml')
 
