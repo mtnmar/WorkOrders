@@ -343,14 +343,12 @@ else:
     # --- Filter to selection ---
     df = df_all[(df_all["Location"] == chosen_loc) & (df_all["ASSET"] == chosen_asset)].copy()
 
-    # --- Order: WORKORDER ASC, then Sort ASC (1=WO,2=PO,3=TRANS), then stable by original row ---
-    df["__row"] = range(len(df))
+    # --- Order: KEEP EXCEL ORDER (no sorting applied here) ---
+    df["__row"] = range(len(df))  # retained for future stability, not used for sorting
     if OPTIONAL_SORT_COL in df.columns:
         df["__sort_key"] = pd.to_numeric(df[OPTIONAL_SORT_COL], errors="coerce").fillna(1).astype(int)
     else:
         df["__sort_key"] = 1
-
-    df.sort_values(by=["WORKORDER", "__sort_key", "__row"], ascending=[True, True, True], inplace=True)
 
     # --- Blank WORKORDER only for Sort in {2,3} ---
     df.loc[df["__sort_key"].isin([2, 3]), "WORKORDER"] = ""
@@ -410,6 +408,7 @@ else:
         """
         with st.expander("ℹ️ Config template"):
             st.code(textwrap.dedent(CONFIG_TEMPLATE).strip(), language="yaml")
+
 
 
 
