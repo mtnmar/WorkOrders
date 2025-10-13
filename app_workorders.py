@@ -71,8 +71,9 @@ st.set_page_config(page_title="SPF Work Orders", page_icon="🧰", layout="wide"
 # ---------- constants ----------
 SHEET_WORKORDERS = "Workorders"
 SHEET_ASSET_MASTER = "Asset_Master"
+SORT_COL = "Sort"  # optional helper column in your Excel
 
-REQUIRED_WO_COLS = [
+REQUIRED_WO_COLS_BASE = [
     "WORKORDER", "TITLE", "STATUS", "PO", "P/N", "QUANTITY RECEIVED",
     "Vendors", "COMPLETED ON", "ASSET", "Location",
 ]
@@ -181,7 +182,8 @@ def get_xlsx_bytes(cfg: dict) -> bytes:
 
 @st.cache_data(show_spinner=False)
 def load_workorders_df(xlsx_bytes: bytes, sheet: str) -> pd.DataFrame:
-    """Load Workorders sheet as strings, keep blanks, enforce required columns & normalize dates."""
+    """Load Workorders sheet as strings, keep blanks, enforce required columns & normalize dates.
+       Keeps the original Excel column order (so Sort is retained if present)."""
     df = pd.read_excel(
         io.BytesIO(xlsx_bytes),
         sheet_name=sheet,
@@ -191,12 +193,9 @@ def load_workorders_df(xlsx_bytes: bytes, sheet: str) -> pd.DataFrame:
     )
     df.columns = [str(c).strip() for c in df.columns]
 
-    missing = [c for c in REQUIRED_WO_COLS if c not in df.columns]
+    missing = [c for c in REQUIRED_WO_COLS_BASE if c not in df.columns]
     if missing:
         raise ValueError(f"Sheet '{sheet}' missing columns: {missing}\nFound: {list(df.columns)}")
-
-    # Keep exact order
-    df = df[REQUIRED_WO_COLS].copy()
 
     # Normalize "COMPLETED ON" to YYYY-MM-DD (date only), keep "" if blank
     def norm_date(s: str) -> str:
@@ -217,7 +216,8 @@ def load_workorders_df(xlsx_bytes: bytes, sheet: str) -> pd.DataFrame:
         except Exception:
             return s
 
-    df["COMPLETED ON"] = df["COMPLETED ON"].map(norm_date)
+    if "COMPLETED ON" in df.columns:
+        df["COMPLETED ON"] = df["COMPLETED ON"].map(norm_date)
 
     # Strip whitespace in all cells
     for c in df.columns:
@@ -261,210 +261,6 @@ def get_data_last_updated() -> str | None:
             headers["Authorization"] = f"token {gh['token']}"
         r = requests.get(url, headers=headers, params=params, timeout=20)
         r.raise_for_status()
-        iso = r.json()[0]["commit"]["committer"]["date"]  # e.g. 2025-10-11T21:07:33Z
-        dt = datetime.fromisoformat(iso.replace("Z", "+00:00")).astimezone(timezone.utc)
-        return dt.strftime("Data last updated: %Y-%m-%d %H:%M UTC")
-    except Exception:
-        return None
+        iso = r.json()[0]["commit"]["comm
 
-
-def to_xlsx_bytes(df: pd.DataFrame, sheet: str) -> bytes:
-    import xlsxwriter
-    buf = io.BytesIO()
-    with pd.ExcelWriter(buf, engine="xlsxwriter") as w:
-        df.to_excel(w, index=False, sheet_name=sheet)
-        ws = w.sheets[sheet]
-        ws.autofilter(0, 0, max(0, len(df)), max(0, len(df.columns) - 1))
-        for i, col in enumerate(df.columns):
-            if df.empty:
-                width = 12
-            else:
-                lens = df[col].astype(str).str.len()
-                q = lens.quantile(0.9) if not lens.empty else 10
-                q = 10 if pd.isna(q) else q
-                width = min(60, max(10, int(q) + 2))
-            ws.set_column(i, i, width)
-    return buf.getvalue()
-
-
-def to_docx_bytes(df: pd.DataFrame, title: str) -> bytes:
-    doc = Document()
-    doc.styles["Normal"].font.name = "Calibri"
-    doc.styles["Normal"].font.size = Pt(10)
-    doc.add_heading(title, level=1)
-    rows, cols = len(df) + 1, len(df.columns)
-    tbl = doc.add_table(rows=rows, cols=cols)
-    tbl.style = "Table Grid"
-    for j, c in enumerate(df.columns):
-        tbl.cell(0, j).text = str(c)
-    for i, (_, r) in enumerate(df.iterrows(), start=1):
-        for j, c in enumerate(df.columns):
-            v = "" if pd.isna(r[c]) else str(r[c])
-            tbl.cell(i, j).text = v
-    out = io.BytesIO()
-    doc.save(out)
-    return out.getvalue()
-
-
-# ---------- App ----------
-st.sidebar.caption(f"SPF Work Orders — v{APP_VERSION}")
-
-cfg = load_config()
-cfg = to_plain(cfg)  # ensure plain dicts
-
-# Auth
-cookie_cfg = cfg.get("cookie", {})
-auth = stauth.Authenticate(
-    cfg.get("credentials", {}),
-    cookie_cfg.get("name", "spf_workorders_portal"),
-    cookie_cfg.get("key", "super_secret_key"),
-    cookie_cfg.get("expiry_days", 7),
-)
-
-name, auth_status, username = auth.login("Login", "main")
-
-if auth_status is False:
-    st.error("Username/password is incorrect")
-elif auth_status is None:
-    st.info("Please log in.")
-else:
-    auth.logout("Logout", "sidebar")
-    st.sidebar.success(f"Logged in as {name}")
-
-    # Last-updated label (from GitHub)
-    updated = get_data_last_updated()
-    if updated:
-        st.sidebar.caption(updated)
-
-    # Load Excel bytes
-    try:
-        xlsx_bytes = get_xlsx_bytes(cfg)
-    except Exception as e:
-        st.error(f"Could not load Excel: {e}")
-        st.stop()
-
-    # Parse sheets with clear errors
-    try:
-        df_all = load_workorders_df(xlsx_bytes, SHEET_WORKORDERS)
-        df_am = load_asset_master_df(xlsx_bytes, SHEET_ASSET_MASTER)
-    except BadZipFile:
-        st.error(
-            "The downloaded file isn’t a valid .xlsx. This usually means the GitHub path/branch/token is wrong, "
-            "or GitHub returned an error page instead of the file. Double-check [github] repo/path/branch in Secrets."
-        )
-        st.stop()
-    except Exception as e:
-        st.error(f"Failed to read Excel: {e}")
-        st.stop()
-
-    # ---- Access control: user -> allowed locations (case-insensitive) ----
-    username_ci = str(username).casefold()
-    admin_users_raw = (cfg.get("access", {}).get("admin_usernames", []) or [])
-    admin_users_ci = {str(u).casefold() for u in admin_users_raw}
-    is_admin = username_ci in admin_users_ci
-
-    ul_raw = (cfg.get("access", {}).get("user_locations", {}) or {})
-    ul_ci_map = {str(k).casefold(): v for k, v in ul_raw.items()}
-    allowed_cfg = ul_ci_map.get(username_ci, [])
-    if isinstance(allowed_cfg, str):
-        allowed_cfg = [allowed_cfg]
-    allowed_cfg = [a for a in (allowed_cfg or [])]
-    star = any(str(a).strip() == "*" for a in allowed_cfg)
-
-    # Distinct Locations available (from Asset_Master to avoid ambiguity)
-    all_locations = sorted(df_am["Location"].dropna().unique().tolist())
-
-    if is_admin or star:
-        allowed_locations = set(all_locations)
-    else:
-        # exact string match against Asset_Master list
-        allowed_locations = {loc for loc in all_locations if loc in set(allowed_cfg)}
-
-    if not allowed_locations:
-        st.error("No Locations configured for your account. Ask an admin to update your access.")
-        with st.expander("Locations present in Asset_Master"):
-            st.write(all_locations)
-        st.stop()
-
-    # ---- UI: Select Location (required) ----
-    loc_placeholder = "— Choose Location —"
-    loc_options = [loc_placeholder] + sorted(allowed_locations)
-    chosen_loc = st.sidebar.selectbox("Location", options=loc_options, index=0)
-    if chosen_loc == loc_placeholder:
-        st.info("Select a Location to load Assets.")
-        st.stop()
-
-    # ---- UI: Select Asset (required, filtered by selected Location) ----
-    assets_for_loc = sorted(
-        df_am.loc[df_am["Location"] == chosen_loc, "ASSET"].dropna().unique().tolist()
-    )
-    asset_placeholder = "— Choose Asset —"
-    asset_options = [asset_placeholder] + assets_for_loc
-    chosen_asset = st.sidebar.selectbox("Asset", options=asset_options, index=0)
-    if chosen_asset == asset_placeholder:
-        st.info("Select an Asset to view its history.")
-        st.stop()
-
-    # ---- Filter Workorders to selection ----
-    df = df_all[(df_all["Location"] == chosen_loc) & (df_all["ASSET"] == chosen_asset)].copy()
-
-    # Sort by Completed On DESC (newest first), then WORKORDER ASC for stability
-    # Empty dates will sink to bottom
-    def _sort_key_date(s: pd.Series):
-        # convert YYYY-MM-DD or "" to sortable tuple
-        return pd.to_datetime(s, errors="coerce")
-
-    df["_sort_date"] = _sort_key_date(df["COMPLETED ON"])
-    df.sort_values(by=["_sort_date", "WORKORDER"], ascending=[False, True], inplace=True)
-    df.drop(columns=["_sort_date"], inplace=True)
-
-    # Display title + table (preserve exact column order)
-    st.markdown(f"### Work Orders — {chosen_loc} — {chosen_asset}")
-    if df.empty:
-        st.info("No history found for this Asset.")
-    st.dataframe(df, use_container_width=True, hide_index=True)
-
-    # Downloads
-    c1, c2, _ = st.columns([1, 1, 3])
-    with c1:
-        st.download_button(
-            label="⬇️ Excel (.xlsx)",
-            data=to_xlsx_bytes(df, sheet="Workorders"),
-            file_name=f"WorkOrders_{chosen_loc}_{chosen_asset}.xlsx".replace(" ", "_"),
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        )
-    with c2:
-        st.download_button(
-            label="⬇️ Word (.docx)",
-            data=to_docx_bytes(df, title=f"Work Orders — {chosen_loc} — {chosen_asset}"),
-            file_name=f"WorkOrders_{chosen_loc}_{chosen_asset}.docx".replace(" ", "_"),
-            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-        )
-
-    # Admin-only: show minimal config template for reference
-    if is_admin:
-        CONFIG_TEMPLATE = """
-        credentials:
-          usernames:
-            demo:
-              name: Demo User
-              email: demo@example.com
-              password: "$2b$12$y2J3Y0rRrJ3fA76h2o//mO6F1T0m3b1vS7QhQ4bW5iX9b5b5b5b5e"
-
-        cookie:
-          name: spf_workorders_portal
-          key: super_secret_key
-          expiry_days: 7
-
-        access:
-          admin_usernames: [demo]
-          user_locations:
-            demo: ['*']
-
-        settings:
-          # Optional local dev path to the workbook (bypasses GitHub)
-          # xlsx_path: "C:/Users/Brad/Desktop/App Master/Workorders.xlsx"
-        """
-        with st.expander("ℹ️ Config template"):
-            st.code(textwrap.dedent(CONFIG_TEMPLATE).strip(), language="yaml")
 
