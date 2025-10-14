@@ -14,14 +14,14 @@ from __future__ import annotations
 import io, textwrap, re
 from pathlib import Path
 from collections.abc import Mapping
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 from zipfile import BadZipFile
 
 import pandas as pd
 import streamlit as st
 import yaml
 
-APP_VERSION = "2025.10.13"
+APP_VERSION = "2025.10.13b"
 
 # ---------- deps ----------
 try:
@@ -170,11 +170,9 @@ def _canonize_headers(cols: list[str], canon: dict[str,set[str]]) -> dict[str, s
     mapping: dict[str, str] = {}
     for key, aliases in canon.items():
         key_low = key.strip().lower()
-        # exact header
         if key_low in low:
             mapping[low[key_low]] = key
             continue
-        # alias match
         for k_low, orig in low.items():
             k_clean = re.sub(r"\s+", " ", k_low)
             if k_clean in aliases or k_low in aliases:
@@ -353,6 +351,7 @@ else:
 
     if st.sidebar.button("🔄 Refresh data"):
         st.cache_data.clear()
+        st.rerun()
 
     try:
         xlsx_bytes = get_xlsx_bytes(cfg)
@@ -510,31 +509,35 @@ else:
             teams = sorted(split_vals)
             team_sel = st.selectbox("Team", options=(["— All teams —"] + teams), index=0)
             if team_sel != "— All teams —":
-                df_scope = df_scope[df_scope["Teams Assigned To"].astype(str).str.contains(rf"(?:^|[;,]\s*){re.escape(team_sel)}(?:\s*[;,]|$)", na=False)]
+                df_scope = df_scope[
+                    df_scope["Teams Assigned To"]
+                    .astype(str)
+                    .str.contains(rf"(?:^|[;,]\s*){re.escape(team_sel)}(?:\s*[;,]|$)", na=False)
+                ]
 
-        # Compute date objects for bucketing
-        today = datetime.now().date()
-        def to_date_or_none(s: str):
-            s = _norm_date_any(s)
-            return None if not s else datetime.strptime(s, "%Y-%m-%d").date()
-        created = df_scope["Created On"].map(to_date_or_none) if "Created On" in df_scope.columns else pd.Series([None]*len(df_scope), index=df_scope.index)
-        start   = df_scope["Start Date"].map(to_date_or_none)   if "Start Date"   in df_scope.columns else pd.Series([None]*len(df_scope), index=df_scope.index)
-        due     = df_scope["Due Date"].map(to_date_or_none)     if "Due Date"     in df_scope.columns else pd.Series([None]*len(df_scope), index=df_scope.index)
-        started = df_scope["Started On"].map(to_date_or_none)   if "Started On"   in df_scope.columns else pd.Series([None]*len(df_scope), index=df_scope.index)
-        done    = df_scope["Completed On"].map(to_date_or_none) if "Completed On" in df_scope.columns else pd.Series([None]*len(df_scope), index=df_scope.index)
-        statusU = df_scope["__STATUS_UP"] if "__STATUS_UP" in df_scope.columns else pd.Series([""]*len(df_scope), index=df_scope.index)
+        # --- Vectorized datetimes for bucketing (fixes .dt error) ---
+        created_dt = pd.to_datetime(df_scope.get("Created On"),  errors="coerce")
+        start_dt   = pd.to_datetime(df_scope.get("Start Date"),  errors="coerce")
+        due_dt     = pd.to_datetime(df_scope.get("Due Date"),    errors="coerce")
+        started_dt = pd.to_datetime(df_scope.get("Started On"),  errors="coerce")
+        done_dt    = pd.to_datetime(df_scope.get("Completed On"),errors="coerce")
+        statusU    = df_scope["__STATUS_UP"] if "__STATUS_UP" in df_scope.columns else pd.Series([""], index=df_scope.index)
+
+        # Use midnight today so comparison is date-based
+        today_ts = pd.Timestamp.today().normalize()
 
         # Buckets
-        is_completed = done.notna() | statusU.isin(DONE_STATUSES)
-        is_overdue   = (~is_completed) & due.notna() & (due < today)
-        # "Open": not completed and in open statuses (regardless of start date)
-        is_open      = (~is_completed) & statusU.isin(OPEN_STATUSES)
-        # "Not Started": not completed and not yet started (Started On missing AND (Start Date missing or in future))
-        is_not_started = (~is_completed) & started.isna() & ((start.isna()) | (start > today))
+        is_completed   = done_dt.notna() | statusU.isin(DONE_STATUSES)
+        is_overdue     = (~is_completed) & due_dt.notna() & (due_dt < today_ts)
+        # OPEN excludes future Start Date
+        is_open        = (~is_completed) & statusU.isin(OPEN_STATUSES) & (start_dt.isna() | (start_dt <= today_ts))
+        # Not Started = not completed & no Started On and (no Start Date or Start Date in future)
+        is_not_started = (~is_completed) & started_dt.isna() & (start_dt.isna() | (start_dt > today_ts))
 
         # Old threshold
         old_days = st.slider("Old threshold (days since Created On)", min_value=15, max_value=120, value=45, step=5)
-        is_old   = (~is_completed) & created.notna() & ((today - created).dt.days >= old_days)
+        age_days = (today_ts - created_dt).dt.days
+        is_old   = (~is_completed) & created_dt.notna() & (age_days >= old_days)
 
         # Tabs within listing
         t_open, t_overdue, t_not_started, t_old = st.tabs(["Open", "Overdue", "Not Started", f"Old (≥ {old_days}d)"])
@@ -555,7 +558,6 @@ else:
                 return
             if sort_keys:
                 df_in = df_in.copy()
-                # normalize sort keys to sortable strings (YYYY-MM-DD already)
                 df_in.sort_values(by=[k for k in sort_keys if k in df_in.columns], inplace=True)
             st.dataframe(df_in[cols] if cols else df_in, use_container_width=True, hide_index=True)
             c1, c2, _ = st.columns([1,1,3])
@@ -588,18 +590,13 @@ else:
 
         with t_old:
             df_old = df_scope[is_old].copy()
-            # add Age (days) for context if Created On exists
-            if "Created On" in df_old.columns:
-                def _age_days(v: str) -> int | None:
-                    s = _norm_date_any(v)
-                    if not s: return None
-                    d = datetime.strptime(s, "%Y-%m-%d").date()
-                    return (today - d).days
+            if not df_old.empty:
                 df_old = df_old.copy()
-                df_old["Age (days)"] = df_old["Created On"].map(_age_days)
+                df_old["Age (days)"] = age_days.loc[df_old.index]
                 if "Age (days)" not in cols_old:
                     cols_old = cols_old + ["Age (days)"]
             show(df_old, f"Old (≥ {old_days}d)", cols_old, sort_keys=["Created On","Due Date"])
+
 
 
 
