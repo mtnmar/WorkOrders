@@ -9,7 +9,7 @@
 #     Workorders                  (history)
 #     Asset_Master                (assets per location)
 #     Workorders_Master           (listing with IsOpen/IsOverdue/IsScheduled/IsCompleted/IsOld flags)
-#     Workorders_Master_service   (service-performed lines per WO)  [used for Service History]
+#     Workorders_Master_Services  (service-performed lines per WO)  [used for Service History]
 #     Service Report              (flat service report; canonical names tolerated)
 #     Users / Users]              (optional pick list of users)
 # - Privacy: never reveal assignments outside allowed locations
@@ -22,12 +22,13 @@ from pathlib import Path
 from collections.abc import Mapping
 from datetime import datetime, timezone, timedelta
 
+import numpy as np
 import pandas as pd
 import streamlit as st
 import yaml
 from zipfile import BadZipFile
 
-APP_VERSION = "2025.10.15b"
+APP_VERSION = "2025.10.15c"
 
 # ---------- deps ----------
 try:
@@ -49,7 +50,7 @@ st.set_page_config(page_title="SPF Work Orders", page_icon="🧰", layout="wide"
 SHEET_WORKORDERS       = "Workorders"         # history sheet
 SHEET_ASSET_MASTER     = "Asset_Master"
 SHEET_WO_MASTER        = "Workorders_Master"  # listing sheet with flags
-SHEET_WO_SERVICE       = "Workorders_Master_service"   # service lines (for Service History)
+SHEET_WO_SERVICE       = "Workorders_Master_Services"   # ✅ service lines (for Service History)
 SHEET_SERVICE_CANDIDATES = ["Service Report", "Service_Report", "ServiceReport"]  # report page source
 SHEET_USERS_CANDIDATES = ["Users", "Users]", "USERS", "users"]
 
@@ -85,7 +86,7 @@ SERVICE_REPORT_CANON = {
     "Due Date": {"due date","next due","target date","next service date"},
 }
 
-# Canon for Service History (from Workorders_Master_service)
+# Canon for Service History (from Workorders_Master_Services)
 SERVICE_HISTORY_CANON = {
     "WO_ID": {"id","wo","workorder","work order","workorder id"},
     "Title": {"title"},
@@ -339,17 +340,10 @@ def load_service_report_df(xlsx_bytes: bytes):
             if "__PctRemain_num" in canon.columns:
                 pr = pd.to_numeric(canon["__PctRemain_num"], errors="coerce")
                 canon["__PctRemain_num"] = pr.where((pr.isna()) | (pr <= 1.0), pr / 100.0)
-            # meter type norm
-            if "Meter Type" in canon.columns:
-                canon["__MeterType_norm"] = canon["Meter Type"].astype(str).str.strip().str.lower()
-            else:
-                canon["__MeterType_norm"] = ""
-            # due date dt
-            if "Due Date" in canon.columns:
-                canon["__Due_dt"] = pd.to_datetime(canon["Due Date"], errors="coerce")
-            else:
-                canon["__Due_dt"] = pd.NaT
-            # tidy some basics
+            # meter type norm + due dt
+            canon["__MeterType_norm"] = canon.get("Meter Type", pd.Series("", index=canon.index)).astype(str).str.strip().str.lower()
+            canon["__Due_dt"] = pd.to_datetime(canon.get("Due Date", ""), errors="coerce")
+            # tidy a few strings
             for c in [x for x in ["WO_ID","Title","Service","Asset","Location","User","Notes","Status"] if x in canon.columns]:
                 canon[c] = canon[c].astype(str).str.strip()
             return raw, canon, nm
@@ -357,7 +351,7 @@ def load_service_report_df(xlsx_bytes: bytes):
             continue
     return None, None, None
 
-# Service History loader (from Workorders_Master_service)
+# Service History loader (from Workorders_Master_Services)
 @st.cache_data(show_spinner=False)
 def load_service_history_df(xlsx_bytes: bytes):
     try:
@@ -604,7 +598,7 @@ else:
         cols_all        = present(["ID","Title","Description","Asset","Created on","Planned Start Date","Due date","Started on","Completed on","Assigned to","Teams Assigned to","Location"])
         cols_open       = present(["ID","Title","Description","Asset","Created on","Due date","Assigned to","Teams Assigned to","Location"])
         cols_overdue    = present(["ID","Title","Description","Asset","Due date","Assigned to","Teams Assigned to","Location"])
-        cols_sched      = present(["ID","Title","Description","Asset","Planned Start Date","Due date","Assigned to","Teams Assigned To","Location"])  # tolerate minor case
+        cols_sched      = present(["ID","Title","Description","Asset","Planned Start Date","Due date","Assigned to","Teams Assigned To","Location"])
         if "Teams Assigned to" in df_view.columns and "Teams Assigned To" in cols_sched:
             cols_sched[cols_sched.index("Teams Assigned To")] = "Teams Assigned to"
         cols_completed  = present(["ID","Title","Description","Asset","Completed on","Assigned to","Teams Assigned to","Location"])
@@ -637,7 +631,11 @@ else:
 
         # 7-day planner (scheduled)
         with st.expander("🗓️ 7-day Scheduled Planner (printable)", expanded=False):
-            df_sched = df_scope[df_scope.get("IsScheduled", False)].copy()
+            if "IsScheduled" in df_scope.columns:
+                mask = df_scope["IsScheduled"].astype(bool)
+            else:
+                mask = pd.Series(False, index=df_scope.index)
+            df_sched = df_scope[mask].copy()
             if df_sched.empty:
                 st.info("No scheduled items.")
             else:
@@ -685,11 +683,9 @@ else:
         for c in raw_sr.columns:
             if c.strip().lower() in {"location","ns location","location2"}:
                 loc_col = c; break
-        loc_values = []
         if loc_col:
             loc_values = sorted([v for v in raw_sr[loc_col].astype(str).unique().tolist() if v in allowed_locations])
         else:
-            # if no recognizable Location column, fall back to allowed list (no-op)
             loc_values = sorted(allowed_locations)
 
         c1, = st.columns([3])
@@ -724,60 +720,33 @@ else:
                     mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
                 )
 
-        # Helper: compute filters for coming-due/overdue
+        # Helper: compute filters for coming-due/overdue (vectorized)
         def _due_frames(df_can: pd.DataFrame):
             if df_can is None or df_can.empty:
                 return pd.DataFrame(), pd.DataFrame()
             df = df_can.copy()
-            # numeric helpers already created: __Schedule_num, __Remaining_num, __PctRemain_num, __Due_dt, __MeterType_norm
-            # Threshold by meter type
-            def row_threshold(r) -> float:
-                mt = str(r.get("__MeterType_norm","")).lower()
-                return 0.05 if ("mile" in mt) else 0.10
 
-            # Coming Due:
-            conds = []
-            # Case A: have Schedule + Remaining
-            condA = (
-                df["__Schedule_num"].notna() & (pd.to_numeric(df["__Schedule_num"], errors="coerce") > 0) &
-                df["__Remaining_num"].notna() &
-                (pd.to_numeric(df["__Remaining_num"], errors="coerce") >= 0)
-            )
-            if condA.any():
-                thrA = df.apply(row_threshold, axis=1)
-                condA2 = pd.to_numeric(df["__Remaining_num"], errors="coerce") <= (pd.to_numeric(df["__Schedule_num"], errors="coerce") * thrA)
-                conds.append(condA & condA2)
+            sched = pd.to_numeric(df.get("__Schedule_num"), errors="coerce")
+            rem   = pd.to_numeric(df.get("__Remaining_num"), errors="coerce")
+            pct   = pd.to_numeric(df.get("__PctRemain_num"), errors="coerce")  # already 0..1 if present
 
-            # Case B: have Percent Remaining (0..1 after normalization)
-            if "__PctRemain_num" in df.columns:
-                condB = df["__PctRemain_num"].notna()
-                if condB.any():
-                    thrB = df.apply(row_threshold, axis=1)
-                    condB2 = pd.to_numeric(df["__PctRemain_num"], errors="coerce") <= thrB
-                    conds.append(condB & condB2)
+            mtype = df.get("__MeterType_norm", pd.Series("", index=df.index)).astype(str)
+            thr_frac = np.where(mtype.str.contains("mile"), 0.05, 0.10)
 
-            coming_due_mask = pd.Series(False, index=df.index)
-            for c in conds:
-                coming_due_mask = coming_due_mask | c
-
-            coming_due = df[coming_due_mask].copy()
+            # Coming due:
+            condA = (sched.notna() & (sched > 0) & rem.notna() & (rem >= 0) & (rem <= sched * thr_frac))
+            condB = pct.notna() & (pct <= thr_frac)
+            coming_due = df[condA | condB].copy()
 
             # Overdue:
             today = pd.Timestamp.today().normalize()
-            overdue_mask = pd.Series(False, index=df.index)
-            # Remaining < 0
-            if "__Remaining_num" in df.columns:
-                overdue_mask = overdue_mask | (pd.to_numeric(df["__Remaining_num"], errors="coerce") < 0)
-            # Or Due Date < today
-            if "__Due_dt" in df.columns:
-                overdue_mask = overdue_mask | (pd.to_datetime(df["__Due_dt"], errors="coerce") < today)
+            due_dt = pd.to_datetime(df.get("__Due_dt"), errors="coerce")
+            overdue = df[(rem.notna() & (rem < 0)) | (due_dt.notna() & (due_dt < today))].copy()
 
-            overdue = df[overdue_mask].copy()
             return coming_due, overdue
 
         coming_due_df, overdue_df = _due_frames(canon_in_scope)
 
-        # pick a compact column set for due/overdue tabs
         def present_due(df: pd.DataFrame, extra: list[str] = None):
             base = ["WO_ID","Title","Service","Asset","Location","Date","User","Status",
                     "Schedule","Remaining","Percent Remaining","Meter Type","Due Date","Notes"]
@@ -822,12 +791,12 @@ else:
                                        file_name="Service_Overdue.docx",
                                        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
 
-    # ========= Page: Service History (from Workorders_Master_service) =========
+    # ========= Page: Service History (from Workorders_Master_Services) =========
     else:
         st.markdown("### Service History")
         df_hist = load_service_history_df(xlsx_bytes)
         if df_hist is None or df_hist.empty:
-            st.warning("No 'Workorders_Master_service' sheet found.")
+            st.warning("No 'Workorders_Master_Services' sheet found.")
             st.stop()
 
         # Restrict to allowed locations
@@ -881,4 +850,5 @@ else:
                 file_name=f"Service_History_{sel_asset.replace(' ','_')}.docx" if assets else "Service_History.docx",
                 mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
             )
+
 
