@@ -16,7 +16,7 @@ import pandas as pd
 import streamlit as st
 import yaml
 
-APP_VERSION = "2025.10.15e"
+APP_VERSION = "2025.10.15f"
 
 # ---------- deps ----------
 try:
@@ -328,7 +328,7 @@ def load_service_report_df(xlsx_bytes: bytes):
             if "__PctRemain_num" in canon.columns:
                 pr = pd.to_numeric(canon["__PctRemain_num"], errors="coerce")
                 canon["__PctRemain_num"] = pr.where((pr.isna()) | (pr <= 1.0), pr/100.0)
-            canon["__MeterType_norm"] = canon.get("Meter Type", pd.Series([], dtype=str)).astype(str).str.strip().str.lower() if "Meter Type" in canon.columns else ""
+            canon["__MeterType_norm"] = canon["Meter Type"].astype(str).str.strip().str.lower() if "Meter Type" in canon.columns else ""
             canon["__Due_dt"] = pd.to_datetime(canon["Due Date"], errors="coerce") if "Due Date" in canon.columns else pd.NaT
             for c in [x for x in ["WO_ID","Title","Service","Asset","Location","User","Notes","Status"] if x in canon.columns]:
                 canon[c] = canon[c].astype(str).str.strip()
@@ -337,22 +337,47 @@ def load_service_report_df(xlsx_bytes: bytes):
             continue
     return None, None, None
 
-# Service History loader — tries multiple sheet names and returns (df, used_sheet)
+# Service History loader — prefers Location2 (falls back to Location / NS Location)
 @st.cache_data(show_spinner=False)
 def load_service_history_df(xlsx_bytes: bytes):
     last_err = None
     for nm in SHEET_WO_SERVICE_CANDS:
         try:
-            df = pd.read_excel(io.BytesIO(xlsx_bytes), sheet_name=nm, dtype=str, keep_default_na=False, engine="openpyxl")
-            df.columns = [str(c).strip() for c in df.columns]
-            df = _canonize_headers(df, SERVICE_HISTORY_CANON)
+            raw = pd.read_excel(io.BytesIO(xlsx_bytes), sheet_name=nm, dtype=str, keep_default_na=False, engine="openpyxl")
+            raw.columns = [str(c).strip() for c in raw.columns]
+
+            # Pick the location column to filter by (Location2 > Location > NS Location)
+            loc2_col = next((c for c in raw.columns if c.strip().lower() in {"location2","location 2","loc2"}), None)
+            loc1_col = next((c for c in raw.columns if c.strip().lower() == "location"), None)
+            nsl_col  = next((c for c in raw.columns if c.strip().lower() in {"ns location","ns_location"}), None)
+
+            chosen_loc_col = loc2_col or loc1_col or nsl_col
+
+            # Canonicalize to standard headers for display
+            df = _canonize_headers(raw.copy(), SERVICE_HISTORY_CANON)
+
+            # If we selected Location2 but canonicalization didn't produce a visible "Location" column,
+            # create one for display.
+            if "Location" not in df.columns and chosen_loc_col:
+                df["Location"] = raw[chosen_loc_col].astype(str).str.strip()
+
+            # Normalize dates, trim strings
             if "Date" in df.columns:
                 df["Date"] = df["Date"].map(_norm_date_any)
             for c in [x for x in ["WO_ID","Title","Service","Asset","Location","User","Notes","Status"] if x in df.columns]:
                 df[c] = df[c].astype(str).str.strip()
-            # Keep only columns we actually use -> lighter memory, faster UI
-            keep = [c for c in ["Date","WO_ID","Title","Service","Asset","User","Location","Notes","Status"] if c in df.columns]
+
+            # Filtering helpers (what we actually filter on)
+            if chosen_loc_col:
+                df["__LocFilter"] = raw[chosen_loc_col].astype(str).str.strip()
+            else:
+                df["__LocFilter"] = df.get("Location", pd.Series([], dtype=str)).astype(str).str.strip()
+            df["__LocNorm"] = df["__LocFilter"].map(_norm_key)
+
+            # Keep lean columns for performance
+            keep = [c for c in ["Date","WO_ID","Title","Service","Asset","User","Location","Notes","Status","__LocFilter","__LocNorm"] if c in df.columns]
             df = df[keep].copy() if keep else df
+
             return df, nm
         except Exception as e:
             last_err = e
@@ -452,10 +477,10 @@ else:
         c1, c2 = st.columns([2, 3])
         with c1:
             loc_options = sorted(allowed_locations)
-            chosen_loc = st.selectbox("Location", options=loc_options, index=0)
+            chosen_loc = st.selectbox("Location", options=loc_options, index=0, key="hist_loc")
         with c2:
             assets_for_loc = sorted(df_am.loc[df_am["Location"] == chosen_loc, "ASSET"].dropna().unique().tolist())
-            chosen_asset = st.selectbox("Asset", options=assets_for_loc, index=0 if assets_for_loc else None)
+            chosen_asset = st.selectbox("Asset", options=assets_for_loc, index=0 if assets_for_loc else None, key="hist_asset")
 
         if not assets_for_loc:
             st.info("No assets for this Location.")
@@ -522,7 +547,7 @@ else:
         with c1:
             loc_values = sorted(df_master["Location"].dropna().unique().tolist())
             loc_all_label = f"« All my locations ({len(loc_values)}) »"
-            chosen_loc = st.selectbox("Location", options=[loc_all_label] + loc_values, index=0)
+            chosen_loc = st.selectbox("Location", options=[loc_all_label] + loc_values, index=0, key="wo_loc")
 
         df_scope = df_master if chosen_loc == loc_all_label else df_master[df_master["Location"] == chosen_loc].copy()
 
@@ -532,7 +557,7 @@ else:
             else:
                 derived_users = sorted([u for u in df_scope.get("Assigned to", pd.Series([], dtype=str)).dropna().astype(str).str.strip().unique().tolist() if u])
                 user_choices = ["— Any user —"] + derived_users
-            sel_user = st.selectbox("Assigned user", options=user_choices, index=0)
+            sel_user = st.selectbox("Assigned user", options=user_choices, index=0, key="wo_user")
 
         with c3:
             raw_teams = df_scope.get("Teams Assigned to", pd.Series([], dtype=str)).fillna("").astype(str)
@@ -543,10 +568,10 @@ else:
                     if t:
                         token_set.add(t)
             team_opts = ["— Any team —"] + sorted(token_set)
-            sel_team = st.selectbox("Team", options=team_opts, index=0)
+            sel_team = st.selectbox("Team", options=team_opts, index=0, key="wo_team")
 
         with c4:
-            view = st.radio("View", ["All","Open","Overdue","Scheduled (Planning)","Completed","Old"], horizontal=True, index=1 if "IsOpen" in df_scope.columns else 0)
+            view = st.radio("View", ["All","Open","Overdue","Scheduled (Planning)","Completed","Old"], horizontal=True, index=1 if "IsOpen" in df_scope.columns else 0, key="wo_view")
 
         if sel_user != "— Any user —":
             df_scope = df_scope[df_scope["Assigned to"].astype(str).str.strip() == sel_user].copy()
@@ -644,21 +669,30 @@ else:
             st.warning("No 'Service Report' sheet found.")
             st.stop()
 
+        # Find a location-like column in the raw report
         loc_col = None
         for c in raw_sr.columns:
             if c.strip().lower() in {"location","ns location","location2"}:
                 loc_col = c; break
+
         if loc_col:
+            # Only show locations the user is allowed to see
+            raw_sr["__loc_norm"] = raw_sr[loc_col].astype(str).map(_norm_key)
             loc_values = sorted([v for v in raw_sr[loc_col].astype(str).unique().tolist() if _norm_key(v) in allowed_norms])
         else:
             loc_values = sorted(allowed_locations)
 
         loc_all_label = f"« All my locations ({len(loc_values)}) »" if loc_values else "« All my locations »"
-        chosen_loc = st.selectbox("Location", options=[loc_all_label] + loc_values if loc_values else [loc_all_label], index=0)
+        chosen_loc = st.selectbox("Location", options=[loc_all_label] + loc_values if loc_values else [loc_all_label], index=0, key="svc_report_loc")
 
         if loc_col and chosen_loc != loc_all_label:
-            raw_show = raw_sr[_norm_key(raw_sr[loc_col]) == _norm_key(chosen_loc)].copy()
-            canon_in_scope = canon_sr[_norm_key(canon_sr["Location"]) == _norm_key(chosen_loc)] if "Location" in canon_sr.columns else canon_sr.copy()
+            mask_raw   = raw_sr[loc_col].astype(str).map(_norm_key) == _norm_key(chosen_loc)
+            raw_show   = raw_sr[mask_raw].copy()
+            if canon_sr is not None and "Location" in canon_sr.columns:
+                mask_canon = canon_sr["Location"].astype(str).map(_norm_key) == _norm_key(chosen_loc)
+                canon_in_scope = canon_sr[mask_canon].copy()
+            else:
+                canon_in_scope = canon_sr.copy()
         else:
             raw_show = raw_sr.copy()
             canon_in_scope = canon_sr.copy()
@@ -667,14 +701,14 @@ else:
 
         with t_report:
             st.caption(f"Source: {source_sheet}  •  Rows: {len(raw_show)}  •  No filters other than Location.")
-            st.dataframe(raw_show, use_container_width=True, hide_index=True)
+            st.dataframe(raw_show.drop(columns=["__loc_norm"], errors="ignore"), use_container_width=True, hide_index=True)
             c1, c2, _ = st.columns([1,1,6])
             with c1:
-                st.download_button("⬇️ Excel (.xlsx)", data=to_xlsx_bytes(raw_show, sheet="Service_Report"),
+                st.download_button("⬇️ Excel (.xlsx)", data=to_xlsx_bytes(raw_show.drop(columns=["__loc_norm"], errors="ignore"), sheet="Service_Report"),
                                    file_name="Service_Report.xlsx",
                                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
             with c2:
-                st.download_button("⬇️ Word (.docx)", data=to_docx_bytes(raw_show, title="Service Report — As Is"),
+                st.download_button("⬇️ Word (.docx)", data=to_docx_bytes(raw_show.drop(columns=["__loc_norm"], errors="ignore"), title="Service Report — As Is"),
                                    file_name="Service_Report.docx",
                                    mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
 
@@ -771,29 +805,24 @@ else:
             st.warning(f"No Service History data found. Tried: {SHEET_WO_SERVICE_CANDS}. Last error: {msg}")
             st.stop()
 
-        # Normalize Locations in DF and restrict to allowed set by normalized key
-        if "Location" in df_hist.columns:
-            df_hist["__LocNorm"] = df_hist["Location"].map(_norm_key)
-            df_hist = df_hist[df_hist["__LocNorm"].isin(allowed_norms)].copy()
+        # Restrict by allowed locations (normalized)
+        df_hist = df_hist[df_hist["__LocNorm"].isin(allowed_norms)].copy()
 
-        # Filters: Location + Asset (using DF values actually present)
+        # Filters: Location (from Location2/Location) + Asset
         c1, c2 = st.columns([2, 3])
         with c1:
-            if "Location" in df_hist.columns:
-                loc_values = sorted(df_hist["Location"].dropna().unique().tolist())
-            else:
-                loc_values = []
+            loc_values = sorted([v for v in df_hist["__LocFilter"].dropna().unique().tolist() if v])
             loc_all_label = f"« All my locations ({len(loc_values)}) »" if loc_values else "« All my locations »"
-            chosen_loc = st.selectbox("Location", options=[loc_all_label] + loc_values if loc_values else [loc_all_label], index=0)
+            chosen_loc = st.selectbox("Location", options=[loc_all_label] + loc_values if loc_values else [loc_all_label], index=0, key="svc_hist_loc")
 
-        if chosen_loc != loc_all_label and "Location" in df_hist.columns:
-            scope = df_hist[_norm_key(df_hist["Location"]) == _norm_key(chosen_loc)].copy()
+        if chosen_loc != loc_all_label:
+            scope = df_hist[df_hist["__LocNorm"] == _norm_key(chosen_loc)].copy()
         else:
             scope = df_hist.copy()
 
         with c2:
             assets = sorted([a for a in scope.get("Asset", pd.Series([], dtype=str)).dropna().astype(str).str.strip().unique().tolist() if a])
-            sel_asset = st.selectbox("Asset", options=assets, index=0 if assets else None)
+            sel_asset = st.selectbox("Asset", options=assets, index=0 if assets else None, key="svc_hist_asset")
 
         if not assets:
             st.info("No assets available in this Location.")
@@ -826,4 +855,5 @@ else:
                 mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
             )
         st.stop()
+
 
