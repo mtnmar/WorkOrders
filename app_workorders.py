@@ -1,14 +1,15 @@
 # app_workorders.py
 # --------------------------------------------------------------
-# SPF Work Orders (reads Excel from a local Workbooks.xlsx in the same repo)
+# SPF Work Orders (reads Workorders.xlsx locally; fallback to GitHub)
 # Pages: Asset History • Work Orders • Service Report • Service History
-# - Privacy-safe by Location; Dates normalized; “Data last updated” shown in ET
-# - Local workbook auto-detected (case-insensitive) or via secrets override
-# - Optional Parquet cache for speed (auto-refresh when workbook changes)
+# Privacy-safe by Location; Dates normalized; “Data last updated” in ET
+# - Local Excel: ./Workorders.xlsx (fast)
+# - Fallback: GitHub secrets if local file missing
+# - Optional Parquet cache is unchanged if enabled in secrets (no change needed)
 # --------------------------------------------------------------
 
 from __future__ import annotations
-import io, re, shutil, json
+import io, re
 from pathlib import Path
 from collections.abc import Mapping
 from datetime import datetime, timedelta, timezone
@@ -18,7 +19,7 @@ import streamlit as st
 import yaml
 from zipfile import BadZipFile
 
-APP_VERSION = "2025.10.16-local-parquet"
+APP_VERSION = "2025.10.16a"
 
 # ---------- deps ----------
 try:
@@ -37,20 +38,24 @@ except Exception:
 st.set_page_config(page_title="SPF Work Orders", page_icon="🧰", layout="wide")
 
 # ---------- constants ----------
+# Workbook sheet names used by the app
 SHEET_WORKORDERS         = "Workorders"                  # history sheet
 SHEET_ASSET_MASTER       = "Asset_Master"
 SHEET_WO_MASTER          = "Workorders_Master"           # listing sheet with flags
-# Accept multiple candidates for Service History:
+# Accept multiple candidates for Service History (your current primary is first):
 SHEET_WO_SERVICE_CANDS   = [
+    "Workorders_master_Services",   # your current sheet (note exact case)
     "Workorders_Master_Services",
     "Workorders_Master_service",
     "Workorders_Master_Service",
     "Workorders Service",
     "Service History",
 ]
+# Service Report tab (you said it’s named “Service Report” now)
 SHEET_SERVICE_CANDIDATES = ["Service Report", "Service_Report", "ServiceReport"]
 SHEET_USERS_CANDIDATES   = ["Users", "Users]", "USERS", "users"]
 
+# Expected columns (history)
 REQUIRED_WO_COLS = [
     "WORKORDER","TITLE","STATUS","PO","P/N","QUANTITY RECEIVED",
     "Vendors","COMPLETED ON","ASSET","Location",
@@ -58,27 +63,32 @@ REQUIRED_WO_COLS = [
 OPTIONAL_SORT_COL = "Sort"
 ASSET_MASTER_COLS = ["Location","ASSET"]
 
+# Columns expected in Workorders_Master
 MASTER_REQUIRED = [
     "ID","Title","Description","Asset","Status","Created on","Planned Start Date",
     "Due date","Started on","Completed on","Assigned to","Teams Assigned to",
     "Completed by","Location","IsOpen","IsOverdue","IsScheduled","IsCompleted","IsOld"
 ]
 
+# Canonical header maps
 SERVICE_REPORT_CANON = {
     "WO_ID":{"workorder","wo","work order","work order id","id","wo id"},
-    "Title":{"title","name"},  # tolerate "Name" column
-    "Service":{"service","procedure","procedure name","task","step","line item","last service type","next service type"},
+    "Title":{"title"},
+    "Service":{"service","procedure","procedure name","task","step","line item"},
+    # Your SR has "Name" for the asset — map it:
     "Asset":{"asset","asset name","name"},
+    # Allow Location/NS Location/Location2
     "Location":{"location","ns location","location2"},
-    "Date":{"date","completed on","performed on","service date","closed on","date of last service"},
+    "Date":{"date","completed on","performed on","service date","closed on"},
     "User":{"user","technician","completed by","performed by","assigned to"},
     "Notes":{"notes","description","comment","comments","details"},
     "Status":{"status"},
-    "Schedule":{"schedule","interval","frequency","meter interval","planned interval","cycle","next service"},
+    # due logic inputs
+    "Schedule":{"schedule","interval","frequency","meter interval","planned interval","cycle"},
     "Remaining":{"remaining","remaining value","units remaining","miles remaining","hours remaining","reading remaining","remaining units"},
     "Percent Remaining":{"percent remaining","% remaining","remaining %","remaining pct","pct remaining"},
     "Meter Type":{"meter type","type","uom","unit","units"},
-    "Due Date":{"due date","next due","target date","next service date"},
+    "Due Date":{"due date","next due","target date","next service date","next service"},
 }
 
 SERVICE_HISTORY_CANON = {
@@ -86,6 +96,7 @@ SERVICE_HISTORY_CANON = {
     "Title":{"title"},
     "Service":{"service","service type","procedure name","procedure","task"},
     "Asset":{"asset","asset name"},
+    # Normalize any Location/Location2 to "Location"
     "Location":{"location","ns location","location2"},
     "Date":{"completed on","performed on","date","service date"},
     "User":{"completed by","technician","assigned to","performed by","user"},
@@ -102,6 +113,7 @@ def to_plain(obj):
     return obj
 
 def load_config() -> dict:
+    # prefer st.secrets, but also allow a local app_config.yaml
     if "app_config" in st.secrets:
         return to_plain(st.secrets["app_config"])
     if "app_config_yaml" in st.secrets:
@@ -120,6 +132,101 @@ def load_config() -> dict:
             return {}
     return {}
 
+def _headers_for_github(raw: bool = True, token: str | None = None) -> dict:
+    h = {"Accept": "application/vnd.github.v3.raw" if raw else "application/vnd.github+json"}
+    if token:
+        h["Authorization"] = f"token {token}"
+    return h
+
+def download_bytes_from_github_file(*, repo: str, path: str, branch: str = "main", token: str | None = None) -> bytes:
+    import requests
+    # contents API first
+    url1 = f"https://api.github.com/repos/{repo}/contents/{path}?ref={branch}"
+    r1 = requests.get(url1, headers=_headers_for_github(True, token), timeout=30)
+    if r1.status_code == 200:
+        data = r1.content
+    else:
+        # raw fallback
+        url2 = f"https://raw.githubusercontent.com/{repo}/{branch}/{path}"
+        r2 = requests.get(url2, headers=_headers_for_github(True, token), timeout=30)
+        if r2.status_code != 200:
+            snippet1 = (r1.text or "")[:200]
+            snippet2 = (r2.text or "")[:200]
+            raise RuntimeError(
+                f"GitHub download failed.\n"
+                f"Contents API ({r1.status_code}): {snippet1}\n"
+                f"Raw URL ({r2.status_code}): {snippet2}"
+            )
+        data = r2.content
+    if not data or len(data) < 100:
+        raise RuntimeError("Downloaded file is unexpectedly small. Check repo/path/branch/token.")
+    head = data[:128].lstrip()
+    if head.startswith(b"{") or b"<html" in head.lower():
+        raise RuntimeError("Got JSON/HTML instead of raw Excel. Check repo/path/branch/token.")
+    return data
+
+def get_xlsx_bytes(cfg: dict) -> bytes:
+    """
+    Load ./Workorders.xlsx from the same repo (fast).
+    If not present, fallback to GitHub secrets (unchanged behavior).
+    """
+    # 1) local setting override (optional)
+    xlsx_path = (cfg.get("settings", {}) or {}).get("xlsx_path")
+    here = Path(__file__).resolve().parent
+    if xlsx_path:
+        p = Path(xlsx_path)
+        if not p.is_absolute():
+            p = (here / xlsx_path).resolve()
+        if not p.exists():
+            raise FileNotFoundError(f"Local Excel not found: {p}")
+        return p.read_bytes()
+
+    # 2) default to ./Workorders.xlsx in this repo
+    local_default = (here / "Workorders.xlsx").resolve()
+    if local_default.exists():
+        return local_default.read_bytes()
+
+    # 3) fallback to GitHub if configured (so you don’t need to change secrets)
+    gh = st.secrets.get("github") if hasattr(st, "secrets") else None
+    if not gh:
+        raise RuntimeError("No local Workorders.xlsx and no [github] secrets configured.")
+    return download_bytes_from_github_file(
+        repo=gh.get("repo"),
+        path=gh.get("path"),
+        branch=gh.get("branch", "main"),
+        token=gh.get("token"),
+    )
+
+def get_data_last_updated() -> str | None:
+    # show latest XLSX commit time (ET) if using GitHub; if local file, show local mtime
+    from zoneinfo import ZoneInfo
+    here = Path(__file__).resolve().parent
+    local_default = (here / "Workorders.xlsx")
+    if local_default.exists():
+        try:
+            ts = local_default.stat().st_mtime
+            dt_et = datetime.fromtimestamp(ts, tz=timezone.utc).astimezone(ZoneInfo("America/New_York"))
+            return dt_et.strftime("Local file modified: %Y-%m-%d %H:%M ET")
+        except Exception:
+            pass
+
+    gh = st.secrets.get("github") if hasattr(st, "secrets") else None
+    if not gh or not gh.get("repo") or not gh.get("path"):
+        return None
+    try:
+        import requests
+        url = f"https://api.github.com/repos/{gh['repo']}/commits"
+        params = {"path": gh["path"], "per_page": 1, "sha": gh.get("branch", "main")}
+        headers = _headers_for_github(False, gh.get("token"))
+        r = requests.get(url, headers=headers, params=params, timeout=20)
+        r.raise_for_status()
+        iso = r.json()[0]["commit"]["committer"]["date"]  # UTC Z
+        dt_utc = datetime.fromisoformat(iso.replace("Z", "+00:00"))
+        dt_et  = dt_utc.astimezone(ZoneInfo("America/New_York"))
+        return dt_et.strftime("Data last updated: %Y-%m-%d %H:%M ET")
+    except Exception:
+        return None
+
 def _norm_date_any(s: str) -> str:
     s = (str(s) if s is not None else "").strip()
     if not s:
@@ -136,6 +243,7 @@ def _norm_date_any(s: str) -> str:
         return s
 
 def _norm_key(x: str) -> str:
+    """Normalize strings for forgiving equality: lowercase, collapse non-alnum to space, squeeze spaces."""
     s = re.sub(r"[^0-9a-z]+", " ", str(x).lower())
     return re.sub(r"\s+", " ", s).strip()
 
@@ -193,128 +301,14 @@ def _canonize_headers(df: pd.DataFrame, canon: dict[str, set[str]]) -> pd.DataFr
                 break
     return df.rename(columns=mapping)
 
-# ---------- Local workbook + ET label ----------
-def get_xlsx_local_bytes(cfg: dict) -> tuple[bytes, float, str | None, str]:
-    """
-    Returns (xlsx_bytes, mtime, display_updated_str, filename).
-    Prefers a local workbook next to this script; tolerant to filename case.
-    Optional override via secrets: [app_config.settings].xlsx_path = "Workorders.xlsx"
-    """
-    from zoneinfo import ZoneInfo
-    here = Path(__file__).resolve().parent
-
-    # 1) explicit override from secrets, if set
-    xlsx_path = (cfg.get("settings", {}) or {}).get("xlsx_path")
-    if xlsx_path:
-        p = Path(xlsx_path)
-        if not p.is_absolute():
-            p = (here / xlsx_path)
-        if p.exists():
-            data = p.read_bytes()
-            mtime = p.stat().st_mtime
-            dt_et = datetime.fromtimestamp(mtime, tz=ZoneInfo("America/New_York"))
-            return data, mtime, dt_et.strftime(f"Data last updated: %Y-%m-%d %H:%M ET (local file: {p.name})"), p.name
-
-    # 2) common exact-name attempts
-    for name in ("workorders.xlsx", "Workorders.xlsx", "WORKORDERS.xlsx"):
-        p = here / name
-        if p.exists():
-            data = p.read_bytes()
-            mtime = p.stat().st_mtime
-            from zoneinfo import ZoneInfo
-            dt_et = datetime.fromtimestamp(mtime, tz=ZoneInfo("America/New_York"))
-            return data, mtime, dt_et.strftime(f"Data last updated: %Y-%m-%d %H:%M ET (local file: {p.name})"), p.name
-
-    # 3) case-insensitive scan (any *.xlsx whose name lower() == "workorders.xlsx")
-    for q in here.glob("*.xlsx"):
-        if q.name.lower() == "workorders.xlsx":
-            data = q.read_bytes()
-            mtime = q.stat().st_mtime
-            from zoneinfo import ZoneInfo
-            dt_et = datetime.fromtimestamp(mtime, tz=ZoneInfo("America/New_York"))
-            return data, mtime, dt_et.strftime(f"Data last updated: %Y-%m-%d %H:%M ET (local file: {q.name})"), q.name
-
-    files = ", ".join(sorted(x.name for x in here.glob("*.xlsx")))
-    raise FileNotFoundError(
-        "Couldn’t find a local workbook.\n"
-        "Place 'Workorders.xlsx' (or 'workorders.xlsx') next to app_workorders.py, "
-        "or set [app_config.settings].xlsx_path in secrets.\n"
-        f"Found .xlsx here: {files}"
-    )
-
-# ---------- Parquet cache (optional) ----------
-def _cache_cfg(cfg: dict) -> tuple[bool, Path]:
-    settings = cfg.get("settings", {}) or {}
-    use_parquet = bool(settings.get("use_parquet", True))
-    raw = settings.get("db_path", "").strip()
-    here = Path(__file__).resolve().parent
-    if not raw:
-        cache_dir = here / ".spf_cache"
-    else:
-        p = Path(raw)
-        if not p.is_absolute():
-            p = here / raw
-        # allow file-like or dir-like; we normalize to a directory
-        if p.suffix.lower() == ".parquet":
-            cache_dir = p.parent / (p.stem + "_dir")
-        else:
-            cache_dir = p
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    return use_parquet, cache_dir
-
-def _manifest_path(cache_dir: Path) -> Path:
-    return cache_dir / "_manifest.json"
-
-def _manifest_load(cache_dir: Path) -> dict:
-    mp = _manifest_path(cache_dir)
-    if mp.exists():
-        try:
-            return json.loads(mp.read_text(encoding="utf-8"))
-        except Exception:
-            return {}
-    return {}
-
-def _manifest_save(cache_dir: Path, excel_mtime: float, filename: str):
-    mp = _manifest_path(cache_dir)
-    mp.write_text(json.dumps({"excel_mtime": excel_mtime, "filename": filename}, indent=2), encoding="utf-8")
-
-def _maybe_reset_cache(cache_dir: Path, excel_mtime: float, filename: str):
-    man = _manifest_load(cache_dir)
-    if (not man) or (abs(man.get("excel_mtime", 0) - excel_mtime) > 0.0001) or (man.get("filename") != filename):
-        # clear old parquet files but keep manifest
-        for p in cache_dir.glob("*.parquet"):
-            try: p.unlink()
-            except Exception: pass
-        _manifest_save(cache_dir, excel_mtime, filename)
-
-def _pq_read(path: Path) -> pd.DataFrame | None:
-    try:
-        import pyarrow  # noqa
-        return pd.read_parquet(path)
-    except Exception:
-        return None
-
-def _pq_write(path: Path, df: pd.DataFrame):
-    try:
-        import pyarrow  # noqa
-        df.to_parquet(path, index=False)
-    except Exception:
-        pass
-
-# ---------- data loaders (with parquet) ----------
+# ---------- data loaders ----------
 @st.cache_data(show_spinner=False)
-def load_workorders_df_cached(xlsx_bytes: bytes, cache_dir: str | Path | None) -> pd.DataFrame:
-    pq = None
-    if cache_dir:
-        pq = _pq_read(Path(cache_dir) / "Workorders.parquet")
-        if pq is not None:
-            return pq
-    # build from Excel
-    df = pd.read_excel(io.BytesIO(xlsx_bytes), sheet_name=SHEET_WORKORDERS, dtype=str, keep_default_na=False, engine="openpyxl")
+def load_workorders_df(xlsx_bytes: bytes, sheet: str) -> pd.DataFrame:
+    df = pd.read_excel(io.BytesIO(xlsx_bytes), sheet_name=sheet, dtype=str, keep_default_na=False, engine="openpyxl")
     df.columns = [str(c).strip() for c in df.columns]
     missing = [c for c in REQUIRED_WO_COLS if c not in df.columns]
     if missing:
-        raise ValueError(f"Sheet '{SHEET_WORKORDERS}' missing columns: {missing}\nFound: {list(df.columns)}")
+        raise ValueError(f"Sheet '{sheet}' missing columns: {missing}\nFound: {list(df.columns)}")
     cols = REQUIRED_WO_COLS[:]
     if OPTIONAL_SORT_COL in df.columns:
         cols += [OPTIONAL_SORT_COL]
@@ -322,38 +316,23 @@ def load_workorders_df_cached(xlsx_bytes: bytes, cache_dir: str | Path | None) -
     df["COMPLETED ON"] = df["COMPLETED ON"].map(_norm_date_any)
     for c in df.columns:
         df[c] = df[c].map(lambda x: x.strip() if isinstance(x, str) else x)
-    if cache_dir:
-        _pq_write(Path(cache_dir) / "Workorders.parquet", df)
     return df
 
 @st.cache_data(show_spinner=False)
-def load_asset_master_df_cached(xlsx_bytes: bytes, cache_dir: str | Path | None) -> pd.DataFrame:
-    pq = None
-    if cache_dir:
-        pq = _pq_read(Path(cache_dir) / "Asset_Master.parquet")
-        if pq is not None:
-            return pq
-    df = pd.read_excel(io.BytesIO(xlsx_bytes), sheet_name=SHEET_ASSET_MASTER, dtype=str, keep_default_na=False, engine="openpyxl")
+def load_asset_master_df(xlsx_bytes: bytes, sheet: str) -> pd.DataFrame:
+    df = pd.read_excel(io.BytesIO(xlsx_bytes), sheet_name=sheet, dtype=str, keep_default_na=False, engine="openpyxl")
     df.columns = [str(c).strip() for c in df.columns]
     missing = [c for c in ASSET_MASTER_COLS if c not in df.columns]
     if missing:
-        raise ValueError(f"Sheet '{SHEET_ASSET_MASTER}' missing columns: {missing}\nFound: {list(df.columns)}")
+        raise ValueError(f"Sheet '{sheet}' missing columns: {missing}\nFound: {list(df.columns)}")
     for c in ASSET_MASTER_COLS:
         df[c] = df[c].map(lambda x: x.strip() if isinstance(x, str) else x)
     df = df[(df["Location"] != "") & (df["ASSET"] != "")]
-    df = df[ASSET_MASTER_COLS].copy()
-    if cache_dir:
-        _pq_write(Path(cache_dir) / "Asset_Master.parquet", df)
-    return df
+    return df[ASSET_MASTER_COLS].copy()
 
 @st.cache_data(show_spinner=False)
-def load_wo_master_df_cached(xlsx_bytes: bytes, cache_dir: str | Path | None) -> pd.DataFrame:
-    pq = None
-    if cache_dir:
-        pq = _pq_read(Path(cache_dir) / "Workorders_Master.parquet")
-        if pq is not None:
-            return pq
-    df = pd.read_excel(io.BytesIO(xlsx_bytes), sheet_name=SHEET_WO_MASTER, dtype=str, keep_default_na=False, engine="openpyxl")
+def load_wo_master_df(xlsx_bytes: bytes, sheet: str) -> pd.DataFrame:
+    df = pd.read_excel(io.BytesIO(xlsx_bytes), sheet_name=sheet, dtype=str, keep_default_na=False, engine="openpyxl")
     df.columns = [str(c).strip() for c in df.columns]
     have = [c for c in MASTER_REQUIRED if c in df.columns]
     if have:
@@ -368,85 +347,63 @@ def load_wo_master_df_cached(xlsx_bytes: bytes, cache_dir: str | Path | None) ->
         df[c] = df[c].astype(str).str.strip()
     if "ID" in df.columns:
         df["ID"] = df["ID"].astype(str).str.strip()
-    if cache_dir:
-        _pq_write(Path(cache_dir) / "Workorders_Master.parquet", df)
     return df
 
-# Service Report: cache BOTH raw and canon
+# Service Report loader
 @st.cache_data(show_spinner=False)
-def load_service_report_df_cached(xlsx_bytes: bytes, cache_dir: str | Path | None):
-    raw_pq = (Path(cache_dir)/"ServiceReport_raw.parquet") if cache_dir else None
-    can_pq = (Path(cache_dir)/"ServiceReport_canon.parquet") if cache_dir else None
-
-    raw_df = _pq_read(raw_pq) if raw_pq is not None else None
-    canon_df = _pq_read(can_pq) if can_pq is not None else None
-    used_sheet = None
-
-    if (raw_df is not None) and (canon_df is not None):
-        return raw_df, canon_df, "(cached)"
-
+def load_service_report_df(xlsx_bytes: bytes):
     for nm in SHEET_SERVICE_CANDIDATES:
         try:
             raw = pd.read_excel(io.BytesIO(xlsx_bytes), sheet_name=nm, dtype=str, keep_default_na=False, engine="openpyxl")
             raw.columns = [str(c).strip() for c in raw.columns]
             canon = _canonize_headers(raw.copy(), SERVICE_REPORT_CANON)
+            # normalize date-like fields we use
             if "Date" in canon.columns:
                 canon["Date"] = canon["Date"].map(_norm_date_any)
             if "Due Date" in canon.columns:
                 canon["Due Date"] = canon["Due Date"].map(_norm_date_any)
+            # numerics needed for due logic
             for col, newcol in [("Schedule","__Schedule_num"), ("Remaining","__Remaining_num"), ("Percent Remaining","__PctRemain_num")]:
                 if col in canon.columns:
                     canon[newcol] = pd.to_numeric(canon[col].astype(str).str.replace("%","", regex=False), errors="coerce")
                 else:
                     canon[newcol] = pd.NA
+            # normalize percent (0..100 -> 0..1)
             if "__PctRemain_num" in canon.columns:
                 pr = pd.to_numeric(canon["__PctRemain_num"], errors="coerce")
                 canon["__PctRemain_num"] = pr.where((pr.isna()) | (pr <= 1.0), pr/100.0)
+            # meter type, due dt
             if "Meter Type" in canon.columns:
                 canon["__MeterType_norm"] = canon["Meter Type"].astype(str).str.strip().str.lower()
             else:
                 canon["__MeterType_norm"] = ""
-            canon["__Due_dt"] = pd.to_datetime(canon["Due Date"], errors="coerce") if "Due Date" in canon.columns else pd.NaT
+            if "Due Date" in canon.columns:
+                canon["__Due_dt"] = pd.to_datetime(canon["Due Date"], errors="coerce")
+            else:
+                canon["__Due_dt"] = pd.NaT
             for c in [x for x in ["WO_ID","Title","Service","Asset","Location","User","Notes","Status"] if x in canon.columns]:
                 canon[c] = canon[c].astype(str).str.strip()
-            used_sheet = nm
-            if raw_pq is not None:
-                _pq_write(raw_pq, raw)
-            if can_pq is not None:
-                _pq_write(can_pq, canon)
             return raw, canon, nm
         except Exception:
             continue
     return None, None, None
 
-# Service History: will map Location2 -> Location if needed; cache
+# Service History loader — tries multiple sheet names and returns (df, used_sheet)
 @st.cache_data(show_spinner=False)
-def load_service_history_df_cached(xlsx_bytes: bytes, cache_dir: str | Path | None):
-    pq = None
-    if cache_dir:
-        pq = _pq_read(Path(cache_dir) / "Workorders_Master_Services.parquet")
-        if pq is not None:
-            return pq, "(cached)"
-
+def load_service_history_df(xlsx_bytes: bytes):
     last_err = None
     for nm in SHEET_WO_SERVICE_CANDS:
         try:
             df = pd.read_excel(io.BytesIO(xlsx_bytes), sheet_name=nm, dtype=str, keep_default_na=False, engine="openpyxl")
             df.columns = [str(c).strip() for c in df.columns]
-            # If Location2 exists, use it as Location
-            if "Location2" in df.columns and "Location" not in df.columns:
-                df = df.rename(columns={"Location2": "Location"})
-            df = _canonize_headers(df, SERVICE_HISTORY_CANON)
-            if "Date" not in df.columns and "Completed on" in df.columns:
-                df = df.rename(columns={"Completed on":"Date"})
+            df = _canonize_headers(df, SERVICE_HISTORY_CANON)  # this maps Location2 -> Location
             if "Date" in df.columns:
                 df["Date"] = df["Date"].map(_norm_date_any)
             for c in [x for x in ["WO_ID","Title","Service","Asset","Location","User","Notes","Status"] if x in df.columns]:
                 df[c] = df[c].astype(str).str.strip()
+            # Keep only columns we show -> lighter memory, faster UI
             keep = [c for c in ["Date","WO_ID","Title","Service","Asset","User","Location","Notes","Status"] if c in df.columns]
             df = df[keep].copy() if keep else df
-            if cache_dir:
-                _pq_write(Path(cache_dir) / "Workorders_Master_Services.parquet", df)
             return df, nm
         except Exception as e:
             last_err = e
@@ -454,13 +411,7 @@ def load_service_history_df_cached(xlsx_bytes: bytes, cache_dir: str | Path | No
     return None, f"{last_err}" if last_err else None
 
 @st.cache_data(show_spinner=False)
-def load_users_sheet_cached(xlsx_bytes: bytes, cache_dir: str | Path | None) -> list[str] | None:
-    pq = None
-    if cache_dir:
-        pq = _pq_read(Path(cache_dir) / "Users.parquet")
-        if pq is not None:
-            # store as one-column DF in parquet
-            return pq.iloc[:,0].astype(str).tolist()
+def load_users_sheet(xlsx_bytes: bytes) -> list[str] | None:
     for name in SHEET_USERS_CANDIDATES:
         try:
             dfu = pd.read_excel(io.BytesIO(xlsx_bytes), sheet_name=name, dtype=str, keep_default_na=False, engine="openpyxl")
@@ -470,8 +421,6 @@ def load_users_sheet_cached(xlsx_bytes: bytes, cache_dir: str | Path | None) -> 
                 continue
             users = [u.strip() for u in dfu[col].astype(str).tolist() if str(u).strip()]
             users = sorted(dict.fromkeys(users))
-            if cache_dir:
-                _pq_write(Path(cache_dir) / "Users.parquet", pd.DataFrame({"User": users}))
             return users
         except Exception:
             pass
@@ -502,45 +451,33 @@ else:
     auth.logout("Logout", "sidebar")
     st.sidebar.success(f"Logged in as {name}")
 
-    # Load workbook (local) + ET timestamp label
-    try:
-        xlsx_bytes, excel_mtime, et_label, excel_filename = get_xlsx_local_bytes(cfg)
-    except Exception as e:
-        st.error(f"Could not load Excel: {e}")
-        st.stop()
-
-    # Parquet cache setup
-    use_parquet, cache_dir = _cache_cfg(cfg)
-    cache_dir_str = str(cache_dir) if use_parquet else None
-    if use_parquet:
-        _maybe_reset_cache(cache_dir, excel_mtime, excel_filename)
-
-    if et_label:
-        st.sidebar.caption(et_label)
+    updated = get_data_last_updated()
+    if updated:
+        st.sidebar.caption(updated)
 
     if st.sidebar.button("🔄 Refresh data"):
-        # clear Streamlit cache and nuke parquet so it rebuilds
-        try:
-            if use_parquet and cache_dir.exists():
-                for p in cache_dir.glob("*.parquet"):
-                    p.unlink()
-        except Exception:
-            pass
         st.cache_data.clear()
         st.rerun()
 
-    # Page choice (sidebar, saves table width)
+    # Pages
     page = st.sidebar.radio(
         "Page",
         ["🔎 Asset History", "📋 Work Orders", "🧾 Service Report", "📚 Service History"],
         index=1
     )
 
-    # Access control: Locations
+    # Load workbook bytes (local file first)
     try:
-        df_am  = load_asset_master_df_cached(xlsx_bytes, cache_dir_str)
+        xlsx_bytes = get_xlsx_bytes(cfg)
+    except Exception as e:
+        st.error(f"Could not load Excel: {e}")
+        st.stop()
+
+    # Access control: Locations via Asset_Master
+    try:
+        df_am = load_asset_master_df(xlsx_bytes, SHEET_ASSET_MASTER)
     except BadZipFile:
-        st.error("The workbook isn’t a valid .xlsx.")
+        st.error("The downloaded file isn’t a valid .xlsx. Check your local file or [github] secrets.")
         st.stop()
     except Exception as e:
         st.error(f"Failed to read Asset_Master: {e}")
@@ -562,7 +499,7 @@ else:
     allowed_locations = set(all_locations) if (is_admin or star) else {loc for loc in all_locations if loc in set(allowed_cfg)}
     allowed_norms = {_norm_key(x) for x in allowed_locations}
 
-    # ============== ROUTER ==============
+    # ========= Asset History =========
     if page == "🔎 Asset History":
         st.markdown("### Asset History")
         c1, c2 = st.columns([2, 3])
@@ -575,60 +512,64 @@ else:
 
         if not assets_for_loc:
             st.info("No assets for this Location.")
-        else:
-            try:
-                df_all = load_workorders_df_cached(xlsx_bytes, cache_dir_str)
-            except Exception as e:
-                st.error(f"Failed to read Workorders (history): {e}")
-                st.stop()
+            st.stop()
 
-            df = df_all[(df_all["Location"] == chosen_loc) & (df_all["ASSET"] == chosen_asset)].copy()
-
-            # Drop negative/zero part transactions (keeps nulls/non-part rows)
-            if "QUANTITY RECEIVED" in df.columns and "P/N" in df.columns:
-                qnum = pd.to_numeric(df["QUANTITY RECEIVED"], errors="coerce")
-                is_part = df["P/N"].astype(str).str.strip().ne("")
-                df = df[~(is_part & qnum.notna() & (qnum <= 0))].copy()
-
-            # Order: WORKORDER ASC, then Sort ASC (1=WO,2=PO,3=TRANS), then stable
-            df["__row"] = range(len(df))
-            if OPTIONAL_SORT_COL in df.columns:
-                df["__sort_key"] = pd.to_numeric(df[OPTIONAL_SORT_COL], errors="coerce").fillna(1).astype(int)
-            else:
-                df["__sort_key"] = 1
-            df.sort_values(by=["WORKORDER","__sort_key","__row"], ascending=[True, True, True], inplace=True)
-            df.loc[df["__sort_key"].isin([2, 3]), "WORKORDER"] = ""
-
-            drop_cols = ["__row","__sort_key", OPTIONAL_SORT_COL]
-            df_out = df.drop(columns=[c for c in drop_cols if c in df.columns], errors="ignore")
-
-            st.dataframe(df_out, use_container_width=True, hide_index=True)
-
-            c1, c2, _ = st.columns([1, 1, 6])
-            with c1:
-                st.download_button(
-                    label="⬇️ Excel (.xlsx)",
-                    data=to_xlsx_bytes(df_out, sheet="Workorders"),
-                    file_name=f"WorkOrders_{chosen_loc}_{chosen_asset}.xlsx".replace(" ","_"),
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                )
-            with c2:
-                st.download_button(
-                    label="⬇️ Word (.docx)",
-                    data=to_docx_bytes(df_out, title=f"Work Orders — {chosen_loc} — {chosen_asset}"),
-                    file_name=f"WorkOrders_{chosen_loc}_{chosen_asset}.docx".replace(" ","_"),
-                    mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                )
-
-    elif page == "📋 Work Orders":
-        st.markdown("### Work Orders — Filtered Views (flags from workbook)")
         try:
-            df_master = load_wo_master_df_cached(xlsx_bytes, cache_dir_str)
+            df_all = load_workorders_df(xlsx_bytes, SHEET_WORKORDERS)
+        except Exception as e:
+            st.error(f"Failed to read Workorders (history): {e}")
+            st.stop()
+
+        df = df_all[(df_all["Location"] == chosen_loc) & (df_all["ASSET"] == chosen_asset)].copy()
+
+        # Drop negative/zero part transactions (keeps nulls/non-part rows)
+        if "QUANTITY RECEIVED" in df.columns and "P/N" in df.columns:
+            qnum = pd.to_numeric(df["QUANTITY RECEIVED"], errors="coerce")
+            is_part = df["P/N"].astype(str).str.strip().ne("")
+            df = df[~(is_part & qnum.notna() & (qnum <= 0))].copy()
+
+        # Order: WORKORDER ASC, then Sort ASC, then stable
+        df["__row"] = range(len(df))
+        if OPTIONAL_SORT_COL in df.columns:
+            df["__sort_key"] = pd.to_numeric(df[OPTIONAL_SORT_COL], errors="coerce").fillna(1).astype(int)
+        else:
+            df["__sort_key"] = 1
+        df.sort_values(by=["WORKORDER","__sort_key","__row"], ascending=[True, True, True], inplace=True)
+        df.loc[df["__sort_key"].isin([2, 3]), "WORKORDER"] = ""
+
+        drop_cols = ["__row","__sort_key", OPTIONAL_SORT_COL]
+        df_out = df.drop(columns=[c for c in drop_cols if c in df.columns], errors="ignore")
+
+        st.dataframe(df_out, use_container_width=True, hide_index=True)
+
+        c1, c2, _ = st.columns([1, 1, 6])
+        with c1:
+            st.download_button(
+                label="⬇️ Excel (.xlsx)",
+                data=to_xlsx_bytes(df_out, sheet="Workorders"),
+                file_name=f"WorkOrders_{chosen_loc}_{chosen_asset}.xlsx".replace(" ","_"),
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+        with c2:
+            st.download_button(
+                label="⬇️ Word (.docx)",
+                data=to_docx_bytes(df_out, title=f"Work Orders — {chosen_loc} — {chosen_asset}"),
+                file_name=f"WorkOrders_{chosen_loc}_{chosen_asset}.docx".replace(" ","_"),
+                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            )
+        st.stop()
+
+    # ========= Work Orders =========
+    if page == "📋 Work Orders":
+        st.markdown("### Work Orders — Filtered Views (flags from workbook)")
+
+        try:
+            df_master = load_wo_master_df(xlsx_bytes, SHEET_WO_MASTER)
         except Exception as e:
             st.error(f"Failed to read '{SHEET_WO_MASTER}': {e}")
             st.stop()
 
-        opt_users = load_users_sheet_cached(xlsx_bytes, cache_dir_str)
+        opt_users = load_users_sheet(xlsx_bytes)
         df_master = df_master[df_master["Location"].isin(allowed_locations)].copy()
         total_in_scope = len(df_master)
 
@@ -748,20 +689,25 @@ else:
             st.download_button("⬇️ Word (.docx)", data=to_docx_bytes(df_view[use_cols], title=f"Work Orders — {view}"),
                                file_name=f"WorkOrders_{view.replace(' ','_')}.docx",
                                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+        st.stop()
 
-    elif page == "🧾 Service Report":
+    # ========= Service Report =========
+    if page == "🧾 Service Report":
         st.markdown("### Service Report")
-        raw_sr, canon_sr, source_sheet = load_service_report_df_cached(xlsx_bytes, cache_dir_str)
+        raw_sr, canon_sr, source_sheet = load_service_report_df(xlsx_bytes)
         if raw_sr is None:
             st.warning("No 'Service Report' sheet found.")
             st.stop()
 
-        # Restrict by allowed locations (only filter used on this page)
+        # Only filter by Location (per your request)
+        # Try to find a location column in raw
         loc_col = None
         for c in raw_sr.columns:
             if c.strip().lower() in {"location","ns location","location2"}:
                 loc_col = c; break
+
         if loc_col:
+            # Only show locations the user is allowed to see
             loc_values = sorted([v for v in raw_sr[loc_col].astype(str).unique().tolist() if _norm_key(v) in allowed_norms])
         else:
             loc_values = sorted(allowed_locations)
@@ -769,9 +715,15 @@ else:
         loc_all_label = f"« All my locations ({len(loc_values)}) »" if loc_values else "« All my locations »"
         chosen_loc = st.selectbox("Location", options=[loc_all_label] + loc_values if loc_values else [loc_all_label], index=0)
 
+        # (Fix) element-wise normalization mask
         if loc_col and chosen_loc != loc_all_label:
-            raw_show = raw_sr[_norm_key(raw_sr[loc_col]) == _norm_key(chosen_loc)].copy()
-            canon_in_scope = canon_sr[_norm_key(canon_sr["Location"]) == _norm_key(chosen_loc)] if "Location" in canon_sr.columns else canon_sr.copy()
+            mask_raw = raw_sr[loc_col].astype(str).map(_norm_key) == _norm_key(chosen_loc)
+            raw_show = raw_sr[mask_raw].copy()
+            if "Location" in canon_sr.columns:
+                mask_can = canon_sr["Location"].astype(str).map(_norm_key) == _norm_key(chosen_loc)
+                canon_in_scope = canon_sr[mask_can].copy()
+            else:
+                canon_in_scope = canon_sr.copy()
         else:
             raw_show = raw_sr.copy()
             canon_in_scope = canon_sr.copy()
@@ -792,7 +744,7 @@ else:
                                    file_name="Service_Report.docx",
                                    mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
 
-        # Helper: compute filters for coming-due/overdue
+        # Helper for Coming Due / Overdue
         def _due_frames(df_can: pd.DataFrame):
             if df_can is None or df_can.empty:
                 return pd.DataFrame(), pd.DataFrame()
@@ -874,18 +826,21 @@ else:
                     st.download_button("⬇️ Word (.docx)", data=to_docx_bytes(show, title="Service — Overdue"),
                                        file_name="Service_Overdue.docx",
                                        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+        st.stop()
 
-    elif page == "📚 Service History":
+    # ========= Service History =========
+    if page == "📚 Service History":
         st.markdown("### Service History")
-        df_hist, used_sheet_or_err = load_service_history_df_cached(xlsx_bytes, cache_dir_str)
+
+        df_hist, used_sheet_or_err = load_service_history_df(xlsx_bytes)
         if df_hist is None or df_hist.empty:
             msg = used_sheet_or_err or "unknown error"
             st.warning(f"No Service History data found. Tried: {SHEET_WO_SERVICE_CANDS}. Last error: {msg}")
             st.stop()
 
-        # Restrict to allowed locations
+        # Restrict Locations to allowed set (canonicalized Location already exists)
         if "Location" in df_hist.columns:
-            df_hist["__LocNorm"] = df_hist["Location"].map(_norm_key)
+            df_hist["__LocNorm"] = df_hist["Location"].astype(str).map(_norm_key)
             df_hist = df_hist[df_hist["__LocNorm"].isin(allowed_norms)].copy()
 
         # Filters: Location + Asset
@@ -899,7 +854,9 @@ else:
             chosen_loc = st.selectbox("Location", options=[loc_all_label] + loc_values if loc_values else [loc_all_label], index=0)
 
         if chosen_loc != loc_all_label and "Location" in df_hist.columns:
-            scope = df_hist[_norm_key(df_hist["Location"]) == _norm_key(chosen_loc)].copy()
+            # (Fix) element-wise normalization mask
+            mask_hist = df_hist["Location"].astype(str).map(_norm_key) == _norm_key(chosen_loc)
+            scope = df_hist[mask_hist].copy()
         else:
             scope = df_hist.copy()
 
@@ -909,32 +866,33 @@ else:
 
         if not assets:
             st.info("No assets available in this Location.")
-        else:
-            scope = scope[scope["Asset"] == sel_asset] if "Asset" in scope.columns else scope
+            st.stop()
 
-            if "Date" in scope.columns:
-                scope = scope.copy()
-                scope["__Date_dt"] = pd.to_datetime(scope["Date"], errors="coerce")
-                scope = scope.sort_values(by="__Date_dt", ascending=False, na_position="last").drop(columns="__Date_dt")
+        scope = scope[scope["Asset"] == sel_asset] if "Asset" in scope.columns else scope
 
-            show_cols = [c for c in ["Date","WO_ID","Title","Service","Asset","User","Location","Notes","Status"] if c in scope.columns]
-            st.caption(f"Sheet used: {used_sheet_or_err} • Rows: {len(scope)}")
-            st.dataframe(scope[show_cols] if show_cols else scope, use_container_width=True, hide_index=True)
+        if "Date" in scope.columns:
+            scope = scope.copy()
+            scope["__Date_dt"] = pd.to_datetime(scope["Date"], errors="coerce")
+            scope = scope.sort_values(by="__Date_dt", ascending=False, na_position="last").drop(columns="__Date_dt")
 
-            c1, c2, _ = st.columns([1,1,6])
-            with c1:
-                st.download_button(
-                    "⬇️ Excel (.xlsx)",
-                    data=to_xlsx_bytes(scope[show_cols] if show_cols else scope, sheet="Service_History"),
-                    file_name=f"Service_History_{sel_asset.replace(' ','_')}.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                )
-            with c2:
-                st.download_button(
-                    "⬇️ Word (.docx)",
-                    data=to_docx_bytes(scope[show_cols] if show_cols else scope, title=f"Service History — {sel_asset}"),
-                    file_name=f"Service_History_{sel_asset.replace(' ','_')}.docx",
-                    mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                )
+        show_cols = [c for c in ["Date","WO_ID","Title","Service","Asset","User","Location","Notes","Status"] if c in scope.columns]
+        st.caption(f"Sheet used: {used_sheet_or_err} • Rows: {len(scope)}")
+        st.dataframe(scope[show_cols] if show_cols else scope, use_container_width=True, hide_index=True)
 
+        c1, c2, _ = st.columns([1,1,6])
+        with c1:
+            st.download_button(
+                "⬇️ Excel (.xlsx)",
+                data=to_xlsx_bytes(scope[show_cols] if show_cols else scope, sheet="Service_History"),
+                file_name=f"Service_History_{sel_asset.replace(' ','_')}.xlsx" if assets else "Service_History.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+        with c2:
+            st.download_button(
+                "⬇️ Word (.docx)",
+                data=to_docx_bytes(scope[show_cols] if show_cols else scope, title=f"Service History — {sel_asset}" if assets else "Service History"),
+                file_name=f"Service_History_{sel_asset.replace(' ','_')}.docx" if assets else "Service_History.docx",
+                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            )
+        st.stop()
 
