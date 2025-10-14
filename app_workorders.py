@@ -467,7 +467,7 @@ else:
                     mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
                 )
 
-       # =========================
+      # =========================
     # Tab 2: Work Orders (listing)
     # =========================
     with tab_list:
@@ -502,7 +502,6 @@ else:
                 since_date = st.date_input("Since date", since_default)
 
             created_dt_all = pd.to_datetime(df_scope.get("Created On"), errors="coerce")
-
             if since_enabled:
                 mask_since = created_dt_all >= pd.Timestamp(since_date)
                 if include_blank_created:
@@ -539,15 +538,26 @@ else:
                 df_scope = df_scope[df_scope["Teams Assigned To"].fillna("").astype(str).map(team_hit)].copy()
             st.caption(f"Rows after team filter: {len(df_scope)}")
 
-            # --- Vectorized datetimes for bucketing ---
-            created_dt = pd.to_datetime(df_scope.get("Created On"),  errors="coerce")
-            start_dt   = pd.to_datetime(df_scope.get("Start Date"),  errors="coerce")
-            due_dt     = pd.to_datetime(df_scope.get("Due Date"),    errors="coerce")
-            started_dt = pd.to_datetime(df_scope.get("Started On"),  errors="coerce")
-            done_dt    = pd.to_datetime(df_scope.get("Completed On"),errors="coerce")
+            # Early debug view
+            with st.expander("🔎 Debug: sample of rows in scope"):
+                st.dataframe(df_scope.head(50), use_container_width=True)
+
+            # --- Vectorized datetimes for bucketing (safe defaults if columns missing) ---
+            def s(col: str):
+                # safe Series default aligned to index
+                return df_scope[col] if col in df_scope.columns else pd.Series(pd.NA, index=df_scope.index)
+
+            created_dt = pd.to_datetime(s("Created On"),  errors="coerce")
+            start_dt   = pd.to_datetime(s("Start Date"),  errors="coerce")
+            due_dt     = pd.to_datetime(s("Due Date"),    errors="coerce")
+            started_dt = pd.to_datetime(s("Started On"),  errors="coerce")
+            done_dt    = pd.to_datetime(s("Completed On"),errors="coerce")
+
+            # ✅ FIXED: build STATUS text safely (use scalar default, not list)
+            status_raw = df_scope["STATUS"] if "STATUS" in df_scope.columns else pd.Series("", index=df_scope.index)
+            status_text = status_raw.astype(str).str.upper()
 
             # Robust status parsing (regex “open-ish” vs “done-ish”)
-            status_text = df_scope.get("STATUS", pd.Series([""], index=df_scope.index)).astype(str).str.upper()
             openish = status_text.str.contains(r'\bOPEN\b|ON[- ]?HOLD|IN[- ]?PROG|IN[- ]?PROCESS|PENDING', regex=True, na=False)
             doneish = status_text.str.contains(r'\bCOMPLETE(D)?\b|CLOSED|RESOLVED|DONE', regex=True, na=False)
 
@@ -627,6 +637,3 @@ else:
                     if "Age (days)" not in cols_old:
                         cols_old = cols_old + ["Age (days)"]
                 show(df_old, f"Old (≥ {old_days}d)", cols_old, sort_keys=["Created On","Due Date"])
-
-            with st.expander("🔎 Debug: sample of rows in scope"):
-                st.dataframe(df_scope.head(50), use_container_width=True)
