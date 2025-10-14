@@ -1,11 +1,8 @@
 # app_workorders.py
 # --------------------------------------------------------------
 # SPF Work Orders (reads Excel from GitHub private repo)
-# - Login via streamlit-authenticator
-# - Access control by Location (user -> allowed locations)
-# - Pages: Asset History • Work Orders • Service Report • Service History
-# - Privacy: never reveal assignments outside allowed locations
-# - Data last updated: latest XLSX commit time shown in ET
+# Pages: Asset History • Work Orders • Service Report • Service History
+# Privacy-safe by Location; Dates normalized; “Data last updated” in ET
 # --------------------------------------------------------------
 
 from __future__ import annotations
@@ -19,7 +16,7 @@ import pandas as pd
 import streamlit as st
 import yaml
 
-APP_VERSION = "2025.10.15d"
+APP_VERSION = "2025.10.15e"
 
 # ---------- deps ----------
 try:
@@ -41,7 +38,14 @@ st.set_page_config(page_title="SPF Work Orders", page_icon="🧰", layout="wide"
 SHEET_WORKORDERS         = "Workorders"                  # history sheet
 SHEET_ASSET_MASTER       = "Asset_Master"
 SHEET_WO_MASTER          = "Workorders_Master"           # listing sheet with flags
-SHEET_WO_SERVICE         = "Workorders_Master_Services"  # <— fixed name (Service History)
+# Accept multiple candidates for Service History:
+SHEET_WO_SERVICE_CANDS   = [
+    "Workorders_Master_Services",
+    "Workorders_Master_service",
+    "Workorders_Master_Service",
+    "Workorders Service",          # just in case
+    "Service History"              # just in case
+]
 SHEET_SERVICE_CANDIDATES = ["Service Report", "Service_Report", "ServiceReport"]
 SHEET_USERS_CANDIDATES   = ["Users", "Users]", "USERS", "users"]
 
@@ -62,7 +66,7 @@ SERVICE_REPORT_CANON = {
     "WO_ID":{"workorder","wo","work order","work order id","id","wo id"},
     "Title":{"title"},
     "Service":{"service","procedure","procedure name","task","step","line item"},
-    "Asset":{"asset"},
+    "Asset":{"asset","asset name"},
     "Location":{"location","ns location","location2"},
     "Date":{"date","completed on","performed on","service date","closed on"},
     "User":{"user","technician","completed by","performed by","assigned to"},
@@ -79,7 +83,7 @@ SERVICE_HISTORY_CANON = {
     "WO_ID":{"id","wo","workorder","work order","workorder id"},
     "Title":{"title"},
     "Service":{"service","procedure name","procedure","task"},
-    "Asset":{"asset"},
+    "Asset":{"asset","asset name"},
     "Location":{"location","ns location","location2"},
     "Date":{"completed on","performed on","date","service date"},
     "User":{"completed by","technician","assigned to","performed by","user"},
@@ -197,21 +201,20 @@ def _norm_date_any(s: str) -> str:
     except Exception:
         return s
 
+def _norm_key(x: str) -> str:
+    """Normalize strings for forgiving equality: lowercase, collapse non-alnum to space, squeeze spaces."""
+    s = re.sub(r"[^0-9a-z]+", " ", str(x).lower())
+    return re.sub(r"\s+", " ", s).strip()
+
 def to_xlsx_bytes(df: pd.DataFrame, sheet: str) -> bytes:
     import xlsxwriter
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="xlsxwriter") as w:
         df.to_excel(w, index=False, sheet_name=sheet)
         ws = w.sheets[sheet]
-        ws.autofilter(0, 0, max(0, len(df)), max(0, len(df.columns) - 1))
+        ws.autofilter(0, 0, max(0, len(df)), max(0, len(df.columns)-1))
         for i, col in enumerate(df.columns):
-            if df.empty:
-                width = 12
-            else:
-                lens = df[col].astype(str).str.len()
-                q = lens.quantile(0.9) if not lens.empty else 10
-                q = 10 if pd.isna(q) else q
-                width = min(60, max(10, int(q) + 2))
+            width = 12 if df.empty else min(60, max(10, int(df[col].astype(str).str.len().quantile(0.9)) + 2))
             ws.set_column(i, i, width)
     return buf.getvalue()
 
@@ -220,7 +223,7 @@ def to_docx_bytes(df: pd.DataFrame, title: str) -> bytes:
     doc.styles["Normal"].font.name = "Calibri"
     doc.styles["Normal"].font.size = Pt(10)
     doc.add_heading(title, level=1)
-    rows, cols = len(df) + 1, len(df.columns)
+    rows, cols = len(df)+1, len(df.columns)
     tbl = doc.add_table(rows=rows, cols=cols)
     tbl.style = "Table Grid"
     for j, c in enumerate(df.columns):
@@ -251,7 +254,8 @@ def _canonize_headers(df: pd.DataFrame, canon: dict[str, set[str]]) -> pd.DataFr
             mapping[low_to_orig[key_l]] = key
             continue
         for low, orig in low_to_orig.items():
-            if (low in aliases) or (low.replace("  "," ") in aliases):
+            low2 = re.sub(r"\s+", " ", low)
+            if low in aliases or low2 in aliases:
                 mapping[orig] = key
                 break
     return df.rename(columns=mapping)
@@ -259,20 +263,14 @@ def _canonize_headers(df: pd.DataFrame, canon: dict[str, set[str]]) -> pd.DataFr
 # ---------- data loaders ----------
 @st.cache_data(show_spinner=False)
 def load_workorders_df(xlsx_bytes: bytes, sheet: str) -> pd.DataFrame:
-    df = pd.read_excel(
-        io.BytesIO(xlsx_bytes),
-        sheet_name=sheet,
-        dtype=str,
-        keep_default_na=False,
-        engine="openpyxl",
-    )
+    df = pd.read_excel(io.BytesIO(xlsx_bytes), sheet_name=sheet, dtype=str, keep_default_na=False, engine="openpyxl")
     df.columns = [str(c).strip() for c in df.columns]
     missing = [c for c in REQUIRED_WO_COLS if c not in df.columns]
     if missing:
         raise ValueError(f"Sheet '{sheet}' missing columns: {missing}\nFound: {list(df.columns)}")
     cols = REQUIRED_WO_COLS[:]
     if OPTIONAL_SORT_COL in df.columns:
-        cols = cols + [OPTIONAL_SORT_COL]
+        cols += [OPTIONAL_SORT_COL]
     df = df[cols].copy()
     df["COMPLETED ON"] = df["COMPLETED ON"].map(_norm_date_any)
     for c in df.columns:
@@ -281,13 +279,7 @@ def load_workorders_df(xlsx_bytes: bytes, sheet: str) -> pd.DataFrame:
 
 @st.cache_data(show_spinner=False)
 def load_asset_master_df(xlsx_bytes: bytes, sheet: str) -> pd.DataFrame:
-    df = pd.read_excel(
-        io.BytesIO(xlsx_bytes),
-        sheet_name=sheet,
-        dtype=str,
-        keep_default_na=False,
-        engine="openpyxl",
-    )
+    df = pd.read_excel(io.BytesIO(xlsx_bytes), sheet_name=sheet, dtype=str, keep_default_na=False, engine="openpyxl")
     df.columns = [str(c).strip() for c in df.columns]
     missing = [c for c in ASSET_MASTER_COLS if c not in df.columns]
     if missing:
@@ -299,13 +291,7 @@ def load_asset_master_df(xlsx_bytes: bytes, sheet: str) -> pd.DataFrame:
 
 @st.cache_data(show_spinner=False)
 def load_wo_master_df(xlsx_bytes: bytes, sheet: str) -> pd.DataFrame:
-    df = pd.read_excel(
-        io.BytesIO(xlsx_bytes),
-        sheet_name=sheet,
-        dtype=str,
-        keep_default_na=False,
-        engine="openpyxl",
-    )
+    df = pd.read_excel(io.BytesIO(xlsx_bytes), sheet_name=sheet, dtype=str, keep_default_na=False, engine="openpyxl")
     df.columns = [str(c).strip() for c in df.columns]
     have = [c for c in MASTER_REQUIRED if c in df.columns]
     if have:
@@ -322,40 +308,28 @@ def load_wo_master_df(xlsx_bytes: bytes, sheet: str) -> pd.DataFrame:
         df["ID"] = df["ID"].astype(str).str.strip()
     return df
 
+# Service Report loader
 @st.cache_data(show_spinner=False)
 def load_service_report_df(xlsx_bytes: bytes):
     for nm in SHEET_SERVICE_CANDIDATES:
         try:
-            raw = pd.read_excel(
-                io.BytesIO(xlsx_bytes),
-                sheet_name=nm,
-                dtype=str,
-                keep_default_na=False,
-                engine="openpyxl",
-            )
+            raw = pd.read_excel(io.BytesIO(xlsx_bytes), sheet_name=nm, dtype=str, keep_default_na=False, engine="openpyxl")
             raw.columns = [str(c).strip() for c in raw.columns]
             canon = _canonize_headers(raw.copy(), SERVICE_REPORT_CANON)
             if "Date" in canon.columns:
                 canon["Date"] = canon["Date"].map(_norm_date_any)
             if "Due Date" in canon.columns:
                 canon["Due Date"] = canon["Due Date"].map(_norm_date_any)
-            # numeric helpers
-            for col, newcol in [("Schedule","__Schedule_num"),("Remaining","__Remaining_num"),("Percent Remaining","__PctRemain_num")]:
+            for col, newcol in [("Schedule","__Schedule_num"), ("Remaining","__Remaining_num"), ("Percent Remaining","__PctRemain_num")]:
                 if col in canon.columns:
                     canon[newcol] = pd.to_numeric(canon[col].astype(str).str.replace("%","", regex=False), errors="coerce")
                 else:
                     canon[newcol] = pd.NA
             if "__PctRemain_num" in canon.columns:
                 pr = pd.to_numeric(canon["__PctRemain_num"], errors="coerce")
-                canon["__PctRemain_num"] = pr.where((pr.isna()) | (pr <= 1.0), pr / 100.0)
-            if "Meter Type" in canon.columns:
-                canon["__MeterType_norm"] = canon["Meter Type"].astype(str).str.strip().str.lower()
-            else:
-                canon["__MeterType_norm"] = ""
-            if "Due Date" in canon.columns:
-                canon["__Due_dt"] = pd.to_datetime(canon["Due Date"], errors="coerce")
-            else:
-                canon["__Due_dt"] = pd.NaT
+                canon["__PctRemain_num"] = pr.where((pr.isna()) | (pr <= 1.0), pr/100.0)
+            canon["__MeterType_norm"] = canon.get("Meter Type", pd.Series([], dtype=str)).astype(str).str.strip().str.lower() if "Meter Type" in canon.columns else ""
+            canon["__Due_dt"] = pd.to_datetime(canon["Due Date"], errors="coerce") if "Due Date" in canon.columns else pd.NaT
             for c in [x for x in ["WO_ID","Title","Service","Asset","Location","User","Notes","Status"] if x in canon.columns]:
                 canon[c] = canon[c].astype(str).str.strip()
             return raw, canon, nm
@@ -363,37 +337,33 @@ def load_service_report_df(xlsx_bytes: bytes):
             continue
     return None, None, None
 
+# Service History loader — tries multiple sheet names and returns (df, used_sheet)
 @st.cache_data(show_spinner=False)
 def load_service_history_df(xlsx_bytes: bytes):
-    try:
-        df = pd.read_excel(
-            io.BytesIO(xlsx_bytes),
-            sheet_name=SHEET_WO_SERVICE,
-            dtype=str,
-            keep_default_na=False,
-            engine="openpyxl",
-        )
-        df.columns = [str(c).strip() for c in df.columns]
-        df = _canonize_headers(df, SERVICE_HISTORY_CANON)
-        if "Date" in df.columns:
-            df["Date"] = df["Date"].map(_norm_date_any)
-        for c in [x for x in ["WO_ID","Title","Service","Asset","Location","User","Notes","Status"] if x in df.columns]:
-            df[c] = df[c].astype(str).str.strip()
-        return df
-    except Exception:
-        return None
+    last_err = None
+    for nm in SHEET_WO_SERVICE_CANDS:
+        try:
+            df = pd.read_excel(io.BytesIO(xlsx_bytes), sheet_name=nm, dtype=str, keep_default_na=False, engine="openpyxl")
+            df.columns = [str(c).strip() for c in df.columns]
+            df = _canonize_headers(df, SERVICE_HISTORY_CANON)
+            if "Date" in df.columns:
+                df["Date"] = df["Date"].map(_norm_date_any)
+            for c in [x for x in ["WO_ID","Title","Service","Asset","Location","User","Notes","Status"] if x in df.columns]:
+                df[c] = df[c].astype(str).str.strip()
+            # Keep only columns we actually use -> lighter memory, faster UI
+            keep = [c for c in ["Date","WO_ID","Title","Service","Asset","User","Location","Notes","Status"] if c in df.columns]
+            df = df[keep].copy() if keep else df
+            return df, nm
+        except Exception as e:
+            last_err = e
+            continue
+    return None, f"{last_err}" if last_err else None
 
 @st.cache_data(show_spinner=False)
 def load_users_sheet(xlsx_bytes: bytes) -> list[str] | None:
     for name in SHEET_USERS_CANDIDATES:
         try:
-            dfu = pd.read_excel(
-                io.BytesIO(xlsx_bytes),
-                sheet_name=name,
-                dtype=str,
-                keep_default_na=False,
-                engine="openpyxl",
-            )
+            dfu = pd.read_excel(io.BytesIO(xlsx_bytes), sheet_name=name, dtype=str, keep_default_na=False, engine="openpyxl")
             cols_low = {c.lower(): c for c in dfu.columns}
             col = cols_low.get("user")
             if not col:
@@ -474,13 +444,9 @@ else:
 
     all_locations = sorted(df_am["Location"].dropna().unique().tolist())
     allowed_locations = set(all_locations) if (is_admin or star) else {loc for loc in all_locations if loc in set(allowed_cfg)}
-    if not allowed_locations:
-        st.error("No Locations configured for your account. Ask an admin to update your access.")
-        with st.expander("Locations present in Asset_Master"):
-            st.write(all_locations)
-        st.stop()
+    allowed_norms = {_norm_key(x) for x in allowed_locations}
 
-    # ========= Page: Asset History =========
+    # ========= Asset History =========
     if page == "🔎 Asset History":
         st.markdown("### Asset History")
         c1, c2 = st.columns([2, 3])
@@ -538,7 +504,7 @@ else:
             )
         st.stop()
 
-    # ========= Page: Work Orders (listing + 7-day planner) =========
+    # ========= Work Orders =========
     if page == "📋 Work Orders":
         st.markdown("### Work Orders — Filtered Views (flags from workbook)")
 
@@ -549,7 +515,6 @@ else:
             st.stop()
 
         opt_users = load_users_sheet(xlsx_bytes)
-
         df_master = df_master[df_master["Location"].isin(allowed_locations)].copy()
         total_in_scope = len(df_master)
 
@@ -581,12 +546,7 @@ else:
             sel_team = st.selectbox("Team", options=team_opts, index=0)
 
         with c4:
-            view = st.radio(
-                "View",
-                ["All", "Open", "Overdue", "Scheduled (Planning)", "Completed", "Old"],
-                horizontal=True,
-                index=1 if "IsOpen" in df_scope.columns else 0
-            )
+            view = st.radio("View", ["All","Open","Overdue","Scheduled (Planning)","Completed","Old"], horizontal=True, index=1 if "IsOpen" in df_scope.columns else 0)
 
         if sel_user != "— Any user —":
             df_scope = df_scope[df_scope["Assigned to"].astype(str).str.strip() == sel_user].copy()
@@ -667,22 +627,16 @@ else:
 
         c1, c2, _ = st.columns([1, 1, 6])
         with c1:
-            st.download_button(
-                "⬇️ Excel (.xlsx)",
-                data=to_xlsx_bytes(df_view[use_cols], sheet="WorkOrders"),
-                file_name=f"WorkOrders_{view.replace(' ','_')}.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            )
+            st.download_button("⬇️ Excel (.xlsx)", data=to_xlsx_bytes(df_view[use_cols], sheet="WorkOrders"),
+                               file_name=f"WorkOrders_{view.replace(' ','_')}.xlsx",
+                               mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
         with c2:
-            st.download_button(
-                "⬇️ Word (.docx)",
-                data=to_docx_bytes(df_view[use_cols], title=f"Work Orders — {view}"),
-                file_name=f"WorkOrders_{view.replace(' ','_')}.docx",
-                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-            )
+            st.download_button("⬇️ Word (.docx)", data=to_docx_bytes(df_view[use_cols], title=f"Work Orders — {view}"),
+                               file_name=f"WorkOrders_{view.replace(' ','_')}.docx",
+                               mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
         st.stop()
 
-    # ========= Page: Service Report (as-is + Coming Due + Overdue) =========
+    # ========= Service Report =========
     if page == "🧾 Service Report":
         st.markdown("### Service Report")
         raw_sr, canon_sr, source_sheet = load_service_report_df(xlsx_bytes)
@@ -690,21 +644,21 @@ else:
             st.warning("No 'Service Report' sheet found.")
             st.stop()
 
-        # Location filter only (as requested)
         loc_col = None
         for c in raw_sr.columns:
             if c.strip().lower() in {"location","ns location","location2"}:
                 loc_col = c; break
         if loc_col:
-            loc_values = sorted([v for v in raw_sr[loc_col].astype(str).unique().tolist() if v in allowed_locations])
+            loc_values = sorted([v for v in raw_sr[loc_col].astype(str).unique().tolist() if _norm_key(v) in allowed_norms])
         else:
             loc_values = sorted(allowed_locations)
+
         loc_all_label = f"« All my locations ({len(loc_values)}) »" if loc_values else "« All my locations »"
         chosen_loc = st.selectbox("Location", options=[loc_all_label] + loc_values if loc_values else [loc_all_label], index=0)
 
         if loc_col and chosen_loc != loc_all_label:
-            raw_show = raw_sr[raw_sr[loc_col].astype(str) == chosen_loc].copy()
-            canon_in_scope = canon_sr[canon_sr["Location"].astype(str) == chosen_loc] if "Location" in canon_sr.columns else canon_sr.copy()
+            raw_show = raw_sr[_norm_key(raw_sr[loc_col]) == _norm_key(chosen_loc)].copy()
+            canon_in_scope = canon_sr[_norm_key(canon_sr["Location"]) == _norm_key(chosen_loc)] if "Location" in canon_sr.columns else canon_sr.copy()
         else:
             raw_show = raw_sr.copy()
             canon_in_scope = canon_sr.copy()
@@ -807,24 +761,35 @@ else:
                                        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
         st.stop()
 
-    # ========= Page: Service History (from Workorders_Master_Services) =========
+    # ========= Service History =========
     if page == "📚 Service History":
         st.markdown("### Service History")
-        df_hist = load_service_history_df(xlsx_bytes)
+
+        df_hist, used_sheet_or_err = load_service_history_df(xlsx_bytes)
         if df_hist is None or df_hist.empty:
-            st.warning(f"No '{SHEET_WO_SERVICE}' sheet found.")
+            msg = used_sheet_or_err or "unknown error"
+            st.warning(f"No Service History data found. Tried: {SHEET_WO_SERVICE_CANDS}. Last error: {msg}")
             st.stop()
 
+        # Normalize Locations in DF and restrict to allowed set by normalized key
         if "Location" in df_hist.columns:
-            df_hist = df_hist[df_hist["Location"].isin(allowed_locations)].copy()
+            df_hist["__LocNorm"] = df_hist["Location"].map(_norm_key)
+            df_hist = df_hist[df_hist["__LocNorm"].isin(allowed_norms)].copy()
 
+        # Filters: Location + Asset (using DF values actually present)
         c1, c2 = st.columns([2, 3])
         with c1:
-            loc_values = sorted(df_hist.get("Location", pd.Series([], dtype=str)).dropna().unique().tolist())
+            if "Location" in df_hist.columns:
+                loc_values = sorted(df_hist["Location"].dropna().unique().tolist())
+            else:
+                loc_values = []
             loc_all_label = f"« All my locations ({len(loc_values)}) »" if loc_values else "« All my locations »"
             chosen_loc = st.selectbox("Location", options=[loc_all_label] + loc_values if loc_values else [loc_all_label], index=0)
 
-        scope = df_hist[(df_hist["Location"] == chosen_loc)] if (chosen_loc != loc_all_label and "Location" in df_hist.columns) else df_hist.copy()
+        if chosen_loc != loc_all_label and "Location" in df_hist.columns:
+            scope = df_hist[_norm_key(df_hist["Location"]) == _norm_key(chosen_loc)].copy()
+        else:
+            scope = df_hist.copy()
 
         with c2:
             assets = sorted([a for a in scope.get("Asset", pd.Series([], dtype=str)).dropna().astype(str).str.strip().unique().tolist() if a])
@@ -842,7 +807,7 @@ else:
             scope = scope.sort_values(by="__Date_dt", ascending=False, na_position="last").drop(columns="__Date_dt")
 
         show_cols = [c for c in ["Date","WO_ID","Title","Service","Asset","User","Location","Notes","Status"] if c in scope.columns]
-        st.caption(f"Rows: {len(scope)}")
+        st.caption(f"Sheet used: {used_sheet_or_err} • Rows: {len(scope)}")
         st.dataframe(scope[show_cols] if show_cols else scope, use_container_width=True, hide_index=True)
 
         c1, c2, _ = st.columns([1,1,6])
