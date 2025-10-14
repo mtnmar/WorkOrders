@@ -467,7 +467,7 @@ else:
                     mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
                 )
 
-       # =========================
+         # =========================
     # Tab 2: Work Orders (listing)
     # =========================
     with tab_list:
@@ -476,8 +476,7 @@ else:
         if df_master is None:
             st.warning(f"Sheet '{SHEET_WO_MASTER}' not found. Add it to the workbook to enable this page.")
         else:
-            # NOTE: df_master["Location"] already = Location2 (preferred) else NS Location
-            # Exact-match against your allowed locations
+            # df_master["Location"] already built as: Location2 (preferred) else NS Location
             loc_values_in_master = sorted(set(df_master["Location"].dropna().astype(str)))
             visible_locs = sorted(set(loc_values_in_master).intersection(set(allowed_locations)))
 
@@ -485,48 +484,58 @@ else:
             loc_options2 = [loc_all_label] + visible_locs
             chosen_loc2 = st.selectbox("Location scope", options=loc_options2, index=0)
 
-            # Scope: by Location, by Assigned User, by Team
-            scope = st.radio("Scope", ["By Location", "Assigned User", "Team"], horizontal=True, index=0)
-
             # Start with exact location filter
             if chosen_loc2 == loc_all_label:
                 df_scope = df_master[df_master["Location"].isin(allowed_locations)].copy()
             else:
                 df_scope = df_master[df_master["Location"] == chosen_loc2].copy()
 
-            # --- "Since" filter (Created On on/after selected date) ---
-            since_default = (pd.Timestamp.today().normalize() - pd.Timedelta(days=180)).date()
-            since_date = st.date_input("Show work orders with **Created On** on/after", since_default)
+            st.caption(f"Rows after location filter: {len(df_scope)}")
+
+            # --- "Since" filter (Created On >= date) ---
+            since_default = (pd.Timestamp.today().normalize() - pd.Timedelta(days=365)).date()
+            c1, c2 = st.columns([1,1])
+            with c1:
+                since_date = st.date_input("Created On on/after", since_default)
+            with c2:
+                include_blank_created = st.checkbox("Include rows with blank 'Created On'", value=True)
+
             created_dt = pd.to_datetime(df_scope.get("Created On"), errors="coerce")
-            if not created_dt.isna().all():
-                df_scope = df_scope[created_dt >= pd.Timestamp(since_date)].copy()
+            mask_since = created_dt >= pd.Timestamp(since_date)
+            if include_blank_created:
+                mask_since = mask_since | created_dt.isna()
 
-            # Optional scoping by Assigned User / Team
-            if scope == "Assigned User":
-                users = sorted(
-                    [u for u in df_scope.get("Assigned To", pd.Series([], dtype=str))
-                         .dropna().astype(str).str.strip().unique().tolist() if u]
-                )
-                user_sel = st.selectbox("Assigned To", options=(["— All users —"] + users), index=0)
-                if user_sel != "— All users —":
-                    df_scope = df_scope[df_scope["Assigned To"].astype(str).str.strip() == user_sel]
+            df_scope = df_scope[mask_since].copy()
+            st.caption(f"Rows after 'since' filter: {len(df_scope)}")
 
-            elif scope == "Team":
-                raw = df_scope.get("Teams Assigned To", pd.Series([], dtype=str)).fillna("").astype(str)
-                split_vals = set()
-                for v in raw:
-                    for p in re.split(r"[;,]", v):
-                        p = p.strip()
-                        if p:
-                            split_vals.add(p)
-                teams = sorted(split_vals)
-                team_sel = st.selectbox("Team", options=(["— All teams —"] + teams), index=0)
-                if team_sel != "— All teams —":
-                    df_scope = df_scope[
-                        df_scope["Teams Assigned To"]
-                        .astype(str)
-                        .str.contains(rf"(?:^|[;,]\s*){re.escape(team_sel)}(?:\s*[;,]|$)", na=False)
-                    ]
+            # --- Assigned User filter (multi-select) ---
+            users = sorted(
+                u for u in df_scope.get("Assigned To", pd.Series([], dtype=str))
+                    .dropna().astype(str).str.strip().unique().tolist() if u
+            )
+            sel_users = st.multiselect("Filter: Assigned User(s)", options=users, default=[])
+            if sel_users:
+                df_scope = df_scope[df_scope["Assigned To"].astype(str).str.strip().isin(sel_users)].copy()
+            st.caption(f"Rows after user filter: {len(df_scope)}")
+
+            # --- Team filter (multi-select; handles comma/semicolon-separated lists) ---
+            raw_teams = df_scope.get("Teams Assigned To", pd.Series([], dtype=str)).fillna("").astype(str)
+            token_set = set()
+            for v in raw_teams:
+                for t in re.split(r"[;,]", v):
+                    t = t.strip()
+                    if t:
+                        token_set.add(t)
+            teams = sorted(token_set)
+            sel_teams = st.multiselect("Filter: Team(s)", options=teams, default=[])
+
+            if sel_teams:
+                sel_norm = {t.strip().casefold() for t in sel_teams}
+                def team_hit(s: str) -> bool:
+                    parts = {p.strip().casefold() for p in re.split(r"[;,]", s) if p.strip()}
+                    return bool(parts & sel_norm)
+                df_scope = df_scope[df_scope["Teams Assigned To"].fillna("").astype(str).map(team_hit)].copy()
+            st.caption(f"Rows after team filter: {len(df_scope)}")
 
             # --- Vectorized datetimes for bucketing ---
             created_dt = pd.to_datetime(df_scope.get("Created On"),  errors="coerce")
@@ -609,6 +618,8 @@ else:
                         cols_old = cols_old + ["Age (days)"]
                 show(df_old, f"Old (≥ {old_days}d)", cols_old, sort_keys=["Created On","Due Date"])
 
+            with st.expander("🔎 Debug: sample of rows in scope"):
+                st.dataframe(df_scope.head(50), use_container_width=True)
 
 
 
