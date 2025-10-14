@@ -1,24 +1,26 @@
 # app_workorders.py
 # --------------------------------------------------------------
-# SPF Work Orders (reads Excel/Parquet from GitHub private repo)
+# SPF Work Orders (reads Excel from GitHub private repo)
 # - Login via streamlit-authenticator
 # - Access control by Location (user -> allowed locations)
 # - Sidebar: choose page
-# - Top-of-page filters per page
-# - Sheets used (if present):
-#     Workorders                  (history)
-#     Asset_Master                (assets per location)
-#     Workorders_Master           (listing with IsOpen/IsOverdue/IsScheduled/IsCompleted/IsOld flags)
-#     Workorders_Master_service   (service-performed lines per WO)  [Service History page]
-#     Service Report              (flat service report; canonical names tolerated)
-#     Users / Users]              (optional pick list of users)
+# - Top-of-page filters for each page (minimal on Service Report per request)
+# - Sheets in the workbook (if present):
+#     Workorders
+#     Asset_Master
+#     Workorders_Master
+#     Workorders_Master_service     (service-performed lines)
+#     Service Report (or variants)
+#     Users / Users]
 # - Privacy: never reveal assignments outside allowed locations
-# - Data last updated: latest XLSX/Parquet commit time shown in ET
-# - Performance: tries Parquet first (fast), then falls back to Excel per sheet
+# - Data last updated: latest XLSX commit time shown in ET
+# - Parquet cache: optional; speeds up repeated loads
+#   * set in secrets/app_config: [app_config.settings] use_parquet=true, db_path="Workorders/.data/spf_cache.parquet"
+#   * first run auto-builds cache; sidebar has a "Rebuild Parquet cache" button
 # --------------------------------------------------------------
 
 from __future__ import annotations
-import io, re, os
+import io, re, json
 from pathlib import Path
 from collections.abc import Mapping
 from datetime import datetime, timezone, timedelta
@@ -38,6 +40,12 @@ except Exception:
     st.stop()
 
 try:
+    import pyarrow  # noqa: F401
+except Exception:
+    st.warning("Parquet speed-ups disabled (pyarrow not installed). Add 'pyarrow>=15' to requirements.txt.")
+    pyarrow = None  # just to avoid lints
+
+try:
     from docx import Document
     from docx.shared import Pt
 except Exception:
@@ -51,7 +59,7 @@ SHEET_WORKORDERS       = "Workorders"         # history sheet
 SHEET_ASSET_MASTER     = "Asset_Master"
 SHEET_WO_MASTER        = "Workorders_Master"  # listing sheet with flags
 SHEET_WO_SERVICE       = "Workorders_Master_service"   # service lines (for Service History)
-SHEET_SERVICE_CANDIDATES = ["Service Report", "Service_Report", "ServiceReport"]  # report page source
+SHEET_SERVICE_CANDIDATES = ["Service Report", "Service_Report", "ServiceReport"]  # report page
 SHEET_USERS_CANDIDATES = ["Users", "Users]", "USERS", "users"]
 
 REQUIRED_WO_COLS = [
@@ -67,7 +75,7 @@ MASTER_REQUIRED = [
     "Completed by","Location","IsOpen","IsOverdue","IsScheduled","IsCompleted","IsOld"
 ]
 
-# Canon for Service Report (used for Coming Due/Overdue logic)
+# Canon for Service Report (canon only used for Coming Due/Overdue logic)
 SERVICE_REPORT_CANON = {
     "WO_ID": {"workorder","wo","work order","work order id","id","wo id"},
     "Title": {"title"},
@@ -78,7 +86,6 @@ SERVICE_REPORT_CANON = {
     "User": {"user","technician","completed by","performed by","assigned to"},
     "Notes": {"notes","description","comment","comments","details"},
     "Status": {"status"},
-    # due logic
     "Schedule": {"schedule","interval","frequency","meter interval","planned interval","cycle"},
     "Remaining": {"remaining","remaining value","units remaining","miles remaining","hours remaining","reading remaining","remaining units"},
     "Percent Remaining": {"percent remaining","% remaining","remaining %","remaining pct","pct remaining"},
@@ -97,17 +104,6 @@ SERVICE_HISTORY_CANON = {
     "User": {"completed by","technician","assigned to","performed by","user"},
     "Notes": {"notes","description","comment","comments","details"},
     "Status": {"status"},
-}
-
-# Potential Parquet filenames (looked up in same repo folder as the XLSX)
-PARQUET_CANDIDATES = {
-    SHEET_ASSET_MASTER: ["Asset_Master.parquet"],
-    SHEET_WO_MASTER: ["Workorders_Master.parquet"],
-    SHEET_WO_SERVICE: ["Workorders_Master_service.parquet"],
-    # Service Report allows several base names
-    "Service Report": ["Service Report.parquet", "Service_Report.parquet", "ServiceReport.parquet"],
-    SHEET_WORKORDERS: ["Workorders.parquet"],  # rarely used; we still keep the Excel fallback
-    "Users": ["Users.parquet"],
 }
 
 # ---------- helpers ----------
@@ -137,7 +133,6 @@ def load_config() -> dict:
             return {}
     return {}
 
-@st.cache_data(ttl=600, show_spinner=False)
 def download_bytes_from_github_file(*, repo: str, path: str, branch: str = "main", token: str | None = None) -> bytes:
     import requests
     def _headers(raw: bool = True):
@@ -145,13 +140,11 @@ def download_bytes_from_github_file(*, repo: str, path: str, branch: str = "main
         if token:
             h["Authorization"] = f"token {token}"
         return h
-    # contents API
     url1 = f"https://api.github.com/repos/{repo}/contents/{path}?ref={branch}"
     r1 = requests.get(url1, headers=_headers(raw=True), timeout=30)
     if r1.status_code == 200:
         data = r1.content
     else:
-        # raw fallback
         url2 = f"https://raw.githubusercontent.com/{repo}/{branch}/{path}"
         r2 = requests.get(url2, headers=_headers(raw=True), timeout=30)
         if r2.status_code != 200:
@@ -163,113 +156,46 @@ def download_bytes_from_github_file(*, repo: str, path: str, branch: str = "main
                 f"Raw URL ({r2.status_code}): {snippet2}"
             )
         data = r2.content
-    if not data or len(data) < 50:
+    if not data or len(data) < 100:
         raise RuntimeError("Downloaded file is unexpectedly small. Check repo/path/branch/token.")
+    head = data[:128].lstrip()
+    if head.startswith(b"{") or b"<html" in head.lower():
+        raise RuntimeError("Got JSON/HTML instead of raw Excel. Check repo/path/branch/token.")
     return data
 
-def _repo_ctx():
-    gh = st.secrets.get("github") if hasattr(st, "secrets") else None
-    if not gh:
-        raise RuntimeError("No [github] secrets found. Configure repo/path/branch/token.")
-    repo = gh.get("repo")
-    base_path = gh.get("path")
-    branch = gh.get("branch", "main")
-    token = gh.get("token")
-    base_dir = base_path.rsplit("/", 1)[0] if "/" in base_path else ""
-    return repo, base_dir, branch, token, base_path
-
-def _path_join(base_dir: str, filename: str) -> str:
-    if not base_dir:
-        return filename
-    return f"{base_dir.rstrip('/')}/{filename.lstrip('/')}"
-
-def _pyarrow_available() -> bool:
-    try:
-        import pyarrow  # noqa: F401
-        return True
-    except Exception:
-        return False
-
-@st.cache_data(ttl=600, show_spinner=False)
-def get_parquet_bytes_if_present(logical_name: str) -> bytes | None:
-    """Try to fetch a Parquet file for `logical_name` from the same repo folder as the XLSX."""
-    # respect settings.use_parquet (default True)
-    cfg = load_config()
-    use_parquet = (cfg.get("settings", {}) or {}).get("use_parquet", True)
-    if not use_parquet or not _pyarrow_available():
-        return None
-    try:
-        repo, base_dir, branch, token, _ = _repo_ctx()
-        candidates = PARQUET_CANDIDATES.get(logical_name, [])
-        for fname in candidates:
-            path = _path_join(base_dir, fname)
-            try:
-                data = download_bytes_from_github_file(repo=repo, path=path, branch=branch, token=token)
-                # Quick sanity check (size)
-                if data and len(data) > 50:
-                    return data
-            except Exception:
-                continue
-        return None
-    except Exception:
-        return None
-
-@st.cache_data(ttl=600, show_spinner=False)
 def get_xlsx_bytes(cfg: dict) -> bytes:
-    """Fetch original XLSX bytes (source of truth) — cached."""
     xlsx_path = (cfg.get("settings", {}) or {}).get("xlsx_path")
     if xlsx_path:
         p = Path(xlsx_path)
         if not p.exists():
             raise FileNotFoundError(f"Local Excel not found: {xlsx_path}")
         return p.read_bytes()
-    repo, base_dir, branch, token, xlsx_file = _repo_ctx()
-    return download_bytes_from_github_file(repo=repo, path=xlsx_file, branch=branch, token=token)
-
-@st.cache_data(ttl=300, show_spinner=False)
-def get_data_last_updated() -> str | None:
-    # Show latest commit time (XLSX or Parquet) in ET
     gh = st.secrets.get("github") if hasattr(st, "secrets") else None
-    if not gh or not gh.get("repo"):
+    if not gh:
+        raise RuntimeError("No [github] secrets found. Configure repo/path/branch/token.")
+    return download_bytes_from_github_file(
+        repo=gh.get("repo"),
+        path=gh.get("path"),
+        branch=gh.get("branch", "main"),
+        token=gh.get("token"),
+    )
+
+def get_data_last_updated() -> str | None:
+    # Show latest XLSX commit time in ET
+    gh = st.secrets.get("github") if hasattr(st, "secrets") else None
+    if not gh or not gh.get("repo") or not gh.get("path"):
         return None
     try:
         import requests
         from zoneinfo import ZoneInfo
-        repo = gh["repo"]
-        branch = gh.get("branch", "main")
-        path = gh.get("path")
-        repo_owner_repo = repo
-
-        def latest_commit_for(path_):
-            url = f"https://api.github.com/repos/{repo_owner_repo}/commits"
-            params = {"path": path_, "per_page": 1, "sha": branch}
-            headers = {"Accept": "application/vnd.github+json"}
-            if gh.get("token"):
-                headers["Authorization"] = f"token {gh['token']}"
-            r = requests.get(url, headers=headers, params=params, timeout=20)
-            r.raise_for_status()
-            js = r.json()
-            if not js:
-                return None
-            return js[0]["commit"]["committer"]["date"]  # UTC Z
-
-        # Prefer Parquet timestamps if present; else use XLSX
-        base_dir = path.rsplit("/", 1)[0] if "/" in path else ""
-        parquet_targets = [
-            *PARQUET_CANDIDATES.get(SHEET_WO_MASTER, []),
-            *PARQUET_CANDIDATES.get("Service Report", []),
-            *PARQUET_CANDIDATES.get(SHEET_WO_SERVICE, []),
-            *PARQUET_CANDIDATES.get(SHEET_ASSET_MASTER, []),
-        ]
-        iso = None
-        for fname in parquet_targets:
-            iso = latest_commit_for(_path_join(base_dir, fname))
-            if iso:
-                break
-        if not iso:
-            iso = latest_commit_for(path)
-        if not iso:
-            return None
+        url = f"https://api.github.com/repos/{gh['repo']}/commits"
+        params = {"path": gh["path"], "per_page": 1, "sha": gh.get("branch", "main")}
+        headers = {"Accept": "application/vnd.github+json"}
+        if gh.get("token"):
+            headers["Authorization"] = f"token {gh['token']}"
+        r = requests.get(url, headers=headers, params=params, timeout=20)
+        r.raise_for_status()
+        iso = r.json()[0]["commit"]["committer"]["date"]  # UTC Z
         dt_utc = datetime.fromisoformat(iso.replace("Z", "+00:00"))
         dt_et  = dt_utc.astimezone(ZoneInfo("America/New_York"))
         return dt_et.strftime("Data last updated: %Y-%m-%d %H:%M ET")
@@ -345,21 +271,67 @@ def _canonize_headers(df: pd.DataFrame, canon: dict[str, set[str]]) -> pd.DataFr
             mapping[low_to_orig[key_l]] = key
             continue
         for low, orig in low_to_orig.items():
-            low_norm = re.sub(r"\s+", " ", low)
-            if (low in aliases) or (low_norm in aliases):
+            if (low in aliases) or (low.replace("  ", " ") in aliases):
                 mapping[orig] = key
                 break
     return df.rename(columns=mapping)
 
-# ---------- data loaders (Parquet fast-path, Excel fallback) ----------
+# ---------- Parquet cache helpers ----------
+def _get_settings(cfg: dict):
+    s = (cfg.get("settings") or {})
+    use_parq = bool(s.get("use_parquet", False))
+    db_path = str(s.get("db_path", "")).strip()
+    return use_parq, db_path
+
+def _cache_dir_from_db_path(db_path: str) -> Path:
+    p = Path(db_path)
+    # If user gave a *.parquet, create a folder alongside it using its stem
+    # e.g., "Workorders/.data/spf_cache.parquet" -> "Workorders/.data/spf_cache/"
+    if p.suffix.lower() == ".parquet":
+        return p.parent / p.stem
+    # If user gave a folder-ish path, use it
+    return p
+
+def _ensure_dir(d: Path):
+    d.mkdir(parents=True, exist_ok=True)
+
+def _pq_path(cache_dir: Path, name: str) -> Path:
+    return cache_dir / f"{name}.parquet"
+
+def _read_pq(cache_dir: Path, name: str) -> pd.DataFrame | None:
+    fp = _pq_path(cache_dir, name)
+    if fp.exists():
+        try:
+            return pd.read_parquet(fp)
+        except Exception:
+            return None
+    return None
+
+def _write_pq(cache_dir: Path, name: str, df: pd.DataFrame):
+    try:
+        df.to_parquet(_pq_path(cache_dir, name), index=False)
+    except Exception:
+        pass
+
+def _read_meta(cache_dir: Path) -> dict:
+    f = cache_dir / "_meta.json"
+    if f.exists():
+        try:
+            return json.loads(f.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+    return {}
+
+def _write_meta(cache_dir: Path, meta: dict):
+    try:
+        (cache_dir / "_meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+
+# ---------- data loaders (Excel -> cleaned DataFrame) ----------
 @st.cache_data(show_spinner=False)
 def load_workorders_df(xlsx_bytes: bytes, sheet: str) -> pd.DataFrame:
-    # history (we keep Excel unless you later export a Workorders.parquet)
-    pq = get_parquet_bytes_if_present(SHEET_WORKORDERS)
-    if pq and _pyarrow_available():
-        df = pd.read_parquet(io.BytesIO(pq))
-    else:
-        df = pd.read_excel(io.BytesIO(xlsx_bytes), sheet_name=sheet, dtype=str, keep_default_na=False, engine="openpyxl")
+    df = pd.read_excel(io.BytesIO(xlsx_bytes), sheet_name=sheet, dtype=str, keep_default_na=False, engine="openpyxl")
     df.columns = [str(c).strip() for c in df.columns]
     missing = [c for c in REQUIRED_WO_COLS if c not in df.columns]
     if missing:
@@ -375,11 +347,7 @@ def load_workorders_df(xlsx_bytes: bytes, sheet: str) -> pd.DataFrame:
 
 @st.cache_data(show_spinner=False)
 def load_asset_master_df(xlsx_bytes: bytes, sheet: str) -> pd.DataFrame:
-    pq = get_parquet_bytes_if_present(SHEET_ASSET_MASTER)
-    if pq and _pyarrow_available():
-        df = pd.read_parquet(io.BytesIO(pq))
-    else:
-        df = pd.read_excel(io.BytesIO(xlsx_bytes), sheet_name=sheet, dtype=str, keep_default_na=False, engine="openpyxl")
+    df = pd.read_excel(io.BytesIO(xlsx_bytes), sheet_name=sheet, dtype=str, keep_default_na=False, engine="openpyxl")
     df.columns = [str(c).strip() for c in df.columns]
     missing = [c for c in ASSET_MASTER_COLS if c not in df.columns]
     if missing:
@@ -391,11 +359,7 @@ def load_asset_master_df(xlsx_bytes: bytes, sheet: str) -> pd.DataFrame:
 
 @st.cache_data(show_spinner=False)
 def load_wo_master_df(xlsx_bytes: bytes, sheet: str) -> pd.DataFrame:
-    pq = get_parquet_bytes_if_present(SHEET_WO_MASTER)
-    if pq and _pyarrow_available():
-        df = pd.read_parquet(io.BytesIO(pq))
-    else:
-        df = pd.read_excel(io.BytesIO(xlsx_bytes), sheet_name=sheet, dtype=str, keep_default_na=False, engine="openpyxl")
+    df = pd.read_excel(io.BytesIO(xlsx_bytes), sheet_name=sheet, dtype=str, keep_default_na=False, engine="openpyxl")
     df.columns = [str(c).strip() for c in df.columns]
     have = [c for c in MASTER_REQUIRED if c in df.columns]
     if have:
@@ -412,113 +376,120 @@ def load_wo_master_df(xlsx_bytes: bytes, sheet: str) -> pd.DataFrame:
         df["ID"] = df["ID"].astype(str).str.strip()
     return df
 
-# Service Report loader: returns (raw_df, canon_df, source_name)
 @st.cache_data(show_spinner=False)
-def load_service_report_df(xlsx_bytes: bytes):
-    pq = get_parquet_bytes_if_present("Service Report")
-    if pq and _pyarrow_available():
-        raw = pd.read_parquet(io.BytesIO(pq))
-        raw.columns = [str(c).strip() for c in raw.columns]
-        canon = _canonize_headers(raw.copy(), SERVICE_REPORT_CANON)
-        # normalize useful fields for due logic
-        if "Date" in canon.columns:
-            canon["Date"] = canon["Date"].map(_norm_date_any)
-        if "Due Date" in canon.columns:
-            canon["Due Date"] = canon["Due Date"].map(_norm_date_any)
-        # numeric helpers
-        for col, newcol in [("Schedule","__Schedule_num"), ("Remaining","__Remaining_num"), ("Percent Remaining","__PctRemain_num")]:
-            if col in canon.columns:
-                canon[newcol] = pd.to_numeric(canon[col].astype(str).str.replace("%","", regex=False), errors="coerce")
-            else:
-                canon[newcol] = pd.NA
-        if "__PctRemain_num" in canon.columns:
-            pr = pd.to_numeric(canon["__PctRemain_num"], errors="coerce")
-            canon["__PctRemain_num"] = pr.where((pr.isna()) | (pr <= 1.0), pr / 100.0)
-        if "Meter Type" in canon.columns:
-            canon["__MeterType_norm"] = canon["Meter Type"].astype(str).str.strip().str.lower()
-        else:
-            canon["__MeterType_norm"] = ""
-        if "Due Date" in canon.columns:
-            canon["__Due_dt"] = pd.to_datetime(canon["Due Date"], errors="coerce")
-        else:
-            canon["__Due_dt"] = pd.NaT
-        for c in [x for x in ["WO_ID","Title","Service","Asset","Location","User","Notes","Status"] if x in canon.columns]:
-            canon[c] = canon[c].astype(str).str.strip()
-        return raw, canon, "Service Report (parquet)"
-    # Excel fallback (try multiple candidate sheet names)
+def _load_service_report_raw(xlsx_bytes: bytes):
     for nm in SHEET_SERVICE_CANDIDATES:
         try:
             raw = pd.read_excel(io.BytesIO(xlsx_bytes), sheet_name=nm, dtype=str, keep_default_na=False, engine="openpyxl")
             raw.columns = [str(c).strip() for c in raw.columns]
-            canon = _canonize_headers(raw.copy(), SERVICE_REPORT_CANON)
-            if "Date" in canon.columns:
-                canon["Date"] = canon["Date"].map(_norm_date_any)
-            if "Due Date" in canon.columns:
-                canon["Due Date"] = canon["Due Date"].map(_norm_date_any)
-            for col, newcol in [("Schedule","__Schedule_num"), ("Remaining","__Remaining_num"), ("Percent Remaining","__PctRemain_num")]:
-                if col in canon.columns:
-                    canon[newcol] = pd.to_numeric(canon[col].astype(str).str.replace("%","", regex=False), errors="coerce")
-                else:
-                    canon[newcol] = pd.NA
-            if "__PctRemain_num" in canon.columns:
-                pr = pd.to_numeric(canon["__PctRemain_num"], errors="coerce")
-                canon["__PctRemain_num"] = pr.where((pr.isna()) | (pr <= 1.0), pr / 100.0)
-            if "Meter Type" in canon.columns:
-                canon["__MeterType_norm"] = canon["Meter Type"].astype(str).str.strip().str.lower()
-            else:
-                canon["__MeterType_norm"] = ""
-            if "Due Date" in canon.columns:
-                canon["__Due_dt"] = pd.to_datetime(canon["Due Date"], errors="coerce")
-            else:
-                canon["__Due_dt"] = pd.NaT
-            for c in [x for x in ["WO_ID","Title","Service","Asset","Location","User","Notes","Status"] if x in canon.columns]:
-                canon[c] = canon[c].astype(str).str.strip()
-            return raw, canon, nm
+            return raw, nm
         except Exception:
             continue
-    return None, None, None
+    return None, None
 
-# Service History loader (from Workorders_Master_service)
+@st.cache_data(show_spinner=False)
+def _canonize_service_report(raw: pd.DataFrame) -> pd.DataFrame:
+    canon = _canonize_headers(raw.copy(), SERVICE_REPORT_CANON)
+    if "Date" in canon.columns:
+        canon["Date"] = canon["Date"].map(_norm_date_any)
+    if "Due Date" in canon.columns:
+        canon["Due Date"] = canon["Due Date"].map(_norm_date_any)
+    # numeric helpers
+    for col, newcol in [("Schedule","__Schedule_num"), ("Remaining","__Remaining_num"), ("Percent Remaining","__PctRemain_num")]:
+        if col in canon.columns:
+            canon[newcol] = pd.to_numeric(canon[col].astype(str).str.replace("%","", regex=False), errors="coerce")
+        else:
+            canon[newcol] = pd.NA
+    if "__PctRemain_num" in canon.columns:
+        pr = pd.to_numeric(canon["__PctRemain_num"], errors="coerce")
+        canon["__PctRemain_num"] = pr.where((pr.isna()) | (pr <= 1.0), pr / 100.0)
+    if "Meter Type" in canon.columns:
+        canon["__MeterType_norm"] = canon["Meter Type"].astype(str).str.strip().str.lower()
+    else:
+        canon["__MeterType_norm"] = ""
+    if "Due Date" in canon.columns:
+        canon["__Due_dt"] = pd.to_datetime(canon["Due Date"], errors="coerce")
+    else:
+        canon["__Due_dt"] = pd.NaT
+    for c in [x for x in ["WO_ID","Title","Service","Asset","Location","User","Notes","Status"] if x in canon.columns]:
+        canon[c] = canon[c].astype(str).str.strip()
+    return canon
+
 @st.cache_data(show_spinner=False)
 def load_service_history_df(xlsx_bytes: bytes):
-    pq = get_parquet_bytes_if_present(SHEET_WO_SERVICE)
-    if pq and _pyarrow_available():
-        df = pd.read_parquet(io.BytesIO(pq))
-    else:
+    try:
         df = pd.read_excel(io.BytesIO(xlsx_bytes), sheet_name=SHEET_WO_SERVICE, dtype=str, keep_default_na=False, engine="openpyxl")
-    df.columns = [str(c).strip() for c in df.columns]
-    df = _canonize_headers(df, SERVICE_HISTORY_CANON)
-    if "Date" in df.columns:
-        df["Date"] = df["Date"].map(_norm_date_any)
-    for c in [x for x in ["WO_ID","Title","Service","Asset","Location","User","Notes","Status"] if x in df.columns]:
-        df[c] = df[c].astype(str).str.strip()
+        df.columns = [str(c).strip() for c in df.columns]
+        df = _canonize_headers(df, SERVICE_HISTORY_CANON)
+        if "Date" in df.columns:
+            df["Date"] = df["Date"].map(_norm_date_any)
+        for c in [x for x in ["WO_ID","Title","Service","Asset","Location","User","Notes","Status"] if x in df.columns]:
+            df[c] = df[c].astype(str).str.strip()
+        return df
+    except Exception:
+        return None
+
+# ---------- Cache-aware wrappers ----------
+def get_with_cache(name: str, builder, *, xlsx_bytes: bytes, args: tuple = (), force_rebuild: bool = False, status: dict | None = None):
+    """Generic parquet-backed loader wrapper."""
+    use_parq, db_path = _get_settings(cfg)
+    cache_dir = _cache_dir_from_db_path(db_path)
+    if not use_parq or pyarrow is None:
+        df = builder(xlsx_bytes, *args)
+        if status is not None:
+            status[name] = "Excel"
+        return df
+
+    _ensure_dir(cache_dir)
+    if (not force_rebuild):
+        cached = _read_pq(cache_dir, name)
+        if cached is not None:
+            if status is not None:
+                status[name] = "Parquet"
+            return cached
+
+    # (re)build from Excel
+    df = builder(xlsx_bytes, *args)
+    _write_pq(cache_dir, name, df)
+    if status is not None:
+        status[name] = "Excel→Parquet"
     return df
 
-@st.cache_data(show_spinner=False)
-def load_users_sheet(xlsx_bytes: bytes) -> list[str] | None:
-    pq = get_parquet_bytes_if_present("Users")
-    if pq and _pyarrow_available():
-        dfu = pd.read_parquet(io.BytesIO(pq))
-        dfu.columns = [str(c).strip() for c in dfu.columns]
-        cols_low = {c.lower(): c for c in dfu.columns}
-        col = cols_low.get("user")
-        if not col:
-            return None
-        users = [u.strip() for u in dfu[col].astype(str).tolist() if str(u).strip()]
-        return sorted(dict.fromkeys(users))
-    for name in SHEET_USERS_CANDIDATES:
-        try:
-            dfu = pd.read_excel(io.BytesIO(xlsx_bytes), sheet_name=name, dtype=str, keep_default_na=False, engine="openpyxl")
-            cols_low = {c.lower(): c for c in dfu.columns}
-            col = cols_low.get("user")
-            if not col:
-                continue
-            users = [u.strip() for u in dfu[col].astype(str).tolist() if str(u).strip()]
-            users = sorted(dict.fromkeys(users))
-            return users
-        except Exception:
-            pass
-    return None
+def get_service_report_with_cache(*, xlsx_bytes: bytes, force_rebuild: bool = False, status: dict | None = None):
+    use_parq, db_path = _get_settings(cfg)
+    cache_dir = _cache_dir_from_db_path(db_path)
+    if not use_parq or pyarrow is None:
+        raw, nm = _load_service_report_raw(xlsx_bytes)
+        canon = _canonize_service_report(raw) if raw is not None else None
+        if status is not None:
+            status["Service Report"] = "Excel"
+        return raw, canon, nm
+
+    _ensure_dir(cache_dir)
+    raw_p = _read_pq(cache_dir, "Service_Report_raw") if not force_rebuild else None
+    canon_p = _read_pq(cache_dir, "Service_Report_canon") if not force_rebuild else None
+    src_nm = None
+    meta = _read_meta(cache_dir)
+    if not force_rebuild:
+        src_nm = (meta.get("service_report_sheet") if isinstance(meta, dict) else None)
+
+    if raw_p is not None and canon_p is not None and src_nm:
+        if status is not None:
+            status["Service Report"] = "Parquet"
+        return raw_p, canon_p, src_nm
+
+    raw, nm = _load_service_report_raw(xlsx_bytes)
+    canon = _canonize_service_report(raw) if raw is not None else None
+    if raw is not None:
+        _write_pq(cache_dir, "Service_Report_raw", raw)
+    if canon is not None:
+        _write_pq(cache_dir, "Service_Report_canon", canon)
+    meta = _read_meta(cache_dir)
+    meta["service_report_sheet"] = nm
+    _write_meta(cache_dir, meta)
+    if status is not None:
+        status["Service Report"] = "Excel→Parquet"
+    return raw, canon, nm
 
 # ---------- App ----------
 st.sidebar.caption(f"SPF Work Orders — v{APP_VERSION}")
@@ -549,6 +520,8 @@ else:
     if updated:
         st.sidebar.caption(updated)
 
+    # cache controls
+    force_rebuild_cache = st.sidebar.button("🧹 Rebuild Parquet cache from Excel")
     if st.sidebar.button("🔄 Refresh data"):
         st.cache_data.clear()
         st.rerun()
@@ -560,7 +533,7 @@ else:
         index=1
     )
 
-    # Load workbook bytes (Excel fallback source)
+    # Load workbook bytes
     try:
         xlsx_bytes = get_xlsx_bytes(cfg)
     except Exception as e:
@@ -569,7 +542,9 @@ else:
 
     # Access control: Locations
     try:
-        df_am  = load_asset_master_df(xlsx_bytes, SHEET_ASSET_MASTER)
+        # use cache-aware wrapper for Asset_Master as well
+        _status = {}
+        df_am  = get_with_cache("Asset_Master", load_asset_master_df, xlsx_bytes=xlsx_bytes, args=(SHEET_ASSET_MASTER,), force_rebuild=force_rebuild_cache, status=_status)
     except BadZipFile:
         st.error("The downloaded file isn’t a valid .xlsx. Check your [github] repo/path/branch/token.")
         st.stop()
@@ -597,6 +572,12 @@ else:
             st.write(all_locations)
         st.stop()
 
+    # small footer on caching
+    use_parq, db_path_cfg = _get_settings(cfg)
+    if use_parq:
+        cache_dir = _cache_dir_from_db_path(db_path_cfg)
+        st.sidebar.caption(f"Cache: {_status.get('Asset_Master','')} • dir: {cache_dir}")
+
     # ========= Page: Asset History =========
     if page == "🔎 Asset History":
         st.markdown("### Asset History")
@@ -612,9 +593,12 @@ else:
             st.info("No assets for this Location.")
             st.stop()
 
-        # Load history when needed
+        # Load history (cache-aware)
+        _status2 = {}
         try:
-            df_all = load_workorders_df(xlsx_bytes, SHEET_WORKORDERS)
+            df_all = get_with_cache("Workorders", load_workorders_df, xlsx_bytes=xlsx_bytes, args=(SHEET_WORKORDERS,), force_rebuild=force_rebuild_cache, status=_status2)
+            if use_parq:
+                st.sidebar.caption(f"Cache: {_status2.get('Workorders')}")
         except Exception as e:
             st.error(f"Failed to read Workorders (history): {e}")
             st.stop()
@@ -661,13 +645,28 @@ else:
     elif page == "📋 Work Orders":
         st.markdown("### Work Orders — Filtered Views (flags from workbook)")
 
+        _status3 = {}
         try:
-            df_master = load_wo_master_df(xlsx_bytes, SHEET_WO_MASTER)
+            df_master = get_with_cache("Workorders_Master", load_wo_master_df, xlsx_bytes=xlsx_bytes, args=(SHEET_WO_MASTER,), force_rebuild=force_rebuild_cache, status=_status3)
+            if use_parq:
+                st.sidebar.caption(f"Cache: {_status3.get('Workorders_Master')}")
         except Exception as e:
             st.error(f"Failed to read '{SHEET_WO_MASTER}': {e}")
             st.stop()
 
-        opt_users = load_users_sheet(xlsx_bytes)  # may be None
+        opt_users = None
+        try:
+            # Optional users sheet (no caching, it’s small)
+            for name in SHEET_USERS_CANDIDATES:
+                dfu = pd.read_excel(io.BytesIO(xlsx_bytes), sheet_name=name, dtype=str, keep_default_na=False, engine="openpyxl")
+                cols_low = {c.lower(): c for c in dfu.columns}
+                col = cols_low.get("user")
+                if col:
+                    users = [u.strip() for u in dfu[col].astype(str).tolist() if str(u).strip()]
+                    opt_users = sorted(dict.fromkeys(users))
+                    break
+        except Exception:
+            pass
 
         # Restrict to allowed locations
         df_master = df_master[df_master["Location"].isin(allowed_locations)].copy()
@@ -736,9 +735,7 @@ else:
         cols_all        = present(["ID","Title","Description","Asset","Created on","Planned Start Date","Due date","Started on","Completed on","Assigned to","Teams Assigned to","Location"])
         cols_open       = present(["ID","Title","Description","Asset","Created on","Due date","Assigned to","Teams Assigned to","Location"])
         cols_overdue    = present(["ID","Title","Description","Asset","Due date","Assigned to","Teams Assigned to","Location"])
-        cols_sched      = present(["ID","Title","Description","Asset","Planned Start Date","Due date","Assigned to","Teams Assigned To","Location"])  # tolerate minor case
-        if "Teams Assigned to" in df_view.columns and "Teams Assigned To" in cols_sched:
-            cols_sched[cols_sched.index("Teams Assigned To")] = "Teams Assigned to"
+        cols_sched      = present(["ID","Title","Description","Asset","Planned Start Date","Due date","Assigned to","Teams Assigned to","Location"])
         cols_completed  = present(["ID","Title","Description","Asset","Completed on","Assigned to","Teams Assigned to","Location"])
         cols_old        = present(["ID","Title","Description","Asset","Created on","Due date","Completed on","Assigned to","Teams Assigned to","Location"])
 
@@ -764,7 +761,7 @@ else:
         if sort_keys:
             df_view = df_view.sort_values(by=sort_keys, na_position="last")
 
-        st.caption(f"In scope: {total_in_scope}  •  After location/user/team filters: {len(df_scope)}  •  Showing ({view}): {len(df_view)}")
+        st.caption(f"In scope: {total_in_scope}  •  After location/user/team: {len(df_scope)}  •  Showing ({view}): {len(df_view)}")
         st.dataframe(df_view[use_cols], use_container_width=True, hide_index=True)
 
         # 7-day planner (scheduled)
@@ -807,12 +804,15 @@ else:
     # ========= Page: Service Report (as-is + Coming Due + Overdue) =========
     elif page == "🧾 Service Report":
         st.markdown("### Service Report")
-        raw_sr, canon_sr, source_sheet = load_service_report_df(xlsx_bytes)
+        status_sr = {}
+        raw_sr, canon_sr, source_sheet = get_service_report_with_cache(xlsx_bytes=xlsx_bytes, force_rebuild=force_rebuild_cache, status=status_sr)
         if raw_sr is None:
             st.warning("No 'Service Report' sheet found.")
             st.stop()
+        if use_parq:
+            st.sidebar.caption(f"Cache: {status_sr.get('Service Report','')}")
 
-        # Restrict by allowed locations (only filter used on this page)
+        # Restrict by allowed locations (the ONLY filter here)
         loc_col = None
         for c in raw_sr.columns:
             if c.strip().lower() in {"location","ns location","location2"}:
@@ -860,25 +860,23 @@ else:
             if df_can is None or df_can.empty:
                 return pd.DataFrame(), pd.DataFrame()
             df = df_can.copy()
-            # Threshold by meter type
+
             def row_threshold(r) -> float:
                 mt = str(r.get("__MeterType_norm","")).lower()
                 return 0.05 if ("mile" in mt) else 0.10
 
-            # Coming Due:
             conds = []
-            # Case A: have Schedule + Remaining
+            # A) Schedule + Remaining
             condA = (
                 df["__Schedule_num"].notna() & (pd.to_numeric(df["__Schedule_num"], errors="coerce") > 0) &
-                df["__Remaining_num"].notna() &
-                (pd.to_numeric(df["__Remaining_num"], errors="coerce") >= 0)
+                df["__Remaining_num"].notna() & (pd.to_numeric(df["__Remaining_num"], errors="coerce") >= 0)
             )
             if condA.any():
                 thrA = df.apply(row_threshold, axis=1)
                 condA2 = pd.to_numeric(df["__Remaining_num"], errors="coerce") <= (pd.to_numeric(df["__Schedule_num"], errors="coerce") * thrA)
                 conds.append(condA & condA2)
 
-            # Case B: have Percent Remaining (0..1 after normalization)
+            # B) Percent Remaining
             if "__PctRemain_num" in df.columns:
                 condB = df["__PctRemain_num"].notna()
                 if condB.any():
@@ -889,23 +887,20 @@ else:
             coming_due_mask = pd.Series(False, index=df.index)
             for c in conds:
                 coming_due_mask = coming_due_mask | c
-
             coming_due = df[coming_due_mask].copy()
 
-            # Overdue:
+            # Overdue
             today = pd.Timestamp.today().normalize()
             overdue_mask = pd.Series(False, index=df.index)
             if "__Remaining_num" in df.columns:
                 overdue_mask = overdue_mask | (pd.to_numeric(df["__Remaining_num"], errors="coerce") < 0)
             if "__Due_dt" in df.columns:
                 overdue_mask = overdue_mask | (pd.to_datetime(df["__Due_dt"], errors="coerce") < today)
-
             overdue = df[overdue_mask].copy()
             return coming_due, overdue
 
         coming_due_df, overdue_df = _due_frames(canon_in_scope)
 
-        # compact column set for due/overdue tabs
         def present_due(df: pd.DataFrame, extra: list[str] = None):
             base = ["WO_ID","Title","Service","Asset","Location","Date","User","Status",
                     "Schedule","Remaining","Percent Remaining","Meter Type","Due Date","Notes"]
@@ -953,7 +948,14 @@ else:
     # ========= Page: Service History (from Workorders_Master_service) =========
     else:
         st.markdown("### Service History")
-        df_hist = load_service_history_df(xlsx_bytes)
+        _status4 = {}
+        try:
+            df_hist = get_with_cache("Workorders_Master_service", load_service_history_df, xlsx_bytes=xlsx_bytes, args=(), force_rebuild=force_rebuild_cache, status=_status4)
+            if use_parq:
+                st.sidebar.caption(f"Cache: {_status4.get('Workorders_Master_service')}")
+        except Exception:
+            df_hist = None
+
         if df_hist is None or df_hist.empty:
             st.warning("No 'Workorders_Master_service' sheet found.")
             st.stop()
@@ -983,7 +985,6 @@ else:
             st.stop()
 
         scope = scope[scope["Asset"] == sel_asset] if "Asset" in scope.columns else scope
-        # Sort newest first by Date if present
         if "Date" in scope.columns:
             scope = scope.copy()
             scope["__Date_dt"] = pd.to_datetime(scope["Date"], errors="coerce")
@@ -1009,5 +1010,4 @@ else:
                 file_name=f"Service_History_{sel_asset.replace(' ','_')}.docx" if assets else "Service_History.docx",
                 mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
             )
-
 
