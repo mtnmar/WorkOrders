@@ -467,7 +467,7 @@ else:
                     mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
                 )
 
-         # =========================
+       # =========================
     # Tab 2: Work Orders (listing)
     # =========================
     with tab_list:
@@ -476,7 +476,7 @@ else:
         if df_master is None:
             st.warning(f"Sheet '{SHEET_WO_MASTER}' not found. Add it to the workbook to enable this page.")
         else:
-            # df_master["Location"] already built as: Location2 (preferred) else NS Location
+            # df_master["Location"] already = Location2 (preferred) else NS Location
             loc_values_in_master = sorted(set(df_master["Location"].dropna().astype(str)))
             visible_locs = sorted(set(loc_values_in_master).intersection(set(allowed_locations)))
 
@@ -484,31 +484,33 @@ else:
             loc_options2 = [loc_all_label] + visible_locs
             chosen_loc2 = st.selectbox("Location scope", options=loc_options2, index=0)
 
-            # Start with exact location filter
+            # Exact location filter
             if chosen_loc2 == loc_all_label:
                 df_scope = df_master[df_master["Location"].isin(allowed_locations)].copy()
             else:
                 df_scope = df_master[df_master["Location"] == chosen_loc2].copy()
-
             st.caption(f"Rows after location filter: {len(df_scope)}")
 
-            # --- "Since" filter (Created On >= date) ---
-            since_default = (pd.Timestamp.today().normalize() - pd.Timedelta(days=365)).date()
-            c1, c2 = st.columns([1,1])
+            # --- Created On "since" filter (toggleable) ---
+            c1, c2, c3 = st.columns([1, 1, 2])
             with c1:
-                since_date = st.date_input("Created On on/after", since_default)
+                since_enabled = st.checkbox("Filter by Created On (since)", value=True)
             with c2:
-                include_blank_created = st.checkbox("Include rows with blank 'Created On'", value=True)
+                include_blank_created = st.checkbox("Include blank Created On", value=True)
+            with c3:
+                since_default = (pd.Timestamp.today().normalize() - pd.Timedelta(days=365)).date()
+                since_date = st.date_input("Since date", since_default)
 
-            created_dt = pd.to_datetime(df_scope.get("Created On"), errors="coerce")
-            mask_since = created_dt >= pd.Timestamp(since_date)
-            if include_blank_created:
-                mask_since = mask_since | created_dt.isna()
+            created_dt_all = pd.to_datetime(df_scope.get("Created On"), errors="coerce")
 
-            df_scope = df_scope[mask_since].copy()
+            if since_enabled:
+                mask_since = created_dt_all >= pd.Timestamp(since_date)
+                if include_blank_created:
+                    mask_since = mask_since | created_dt_all.isna()
+                df_scope = df_scope[mask_since].copy()
             st.caption(f"Rows after 'since' filter: {len(df_scope)}")
 
-            # --- Assigned User filter (multi-select) ---
+            # --- Assigned User multi-select ---
             users = sorted(
                 u for u in df_scope.get("Assigned To", pd.Series([], dtype=str))
                     .dropna().astype(str).str.strip().unique().tolist() if u
@@ -518,7 +520,7 @@ else:
                 df_scope = df_scope[df_scope["Assigned To"].astype(str).str.strip().isin(sel_users)].copy()
             st.caption(f"Rows after user filter: {len(df_scope)}")
 
-            # --- Team filter (multi-select; handles comma/semicolon-separated lists) ---
+            # --- Team multi-select (comma/semicolon aware) ---
             raw_teams = df_scope.get("Teams Assigned To", pd.Series([], dtype=str)).fillna("").astype(str)
             token_set = set()
             for v in raw_teams:
@@ -543,17 +545,25 @@ else:
             due_dt     = pd.to_datetime(df_scope.get("Due Date"),    errors="coerce")
             started_dt = pd.to_datetime(df_scope.get("Started On"),  errors="coerce")
             done_dt    = pd.to_datetime(df_scope.get("Completed On"),errors="coerce")
-            statusU    = df_scope["__STATUS_UP"] if "__STATUS_UP" in df_scope.columns else pd.Series([""], index=df_scope.index)
+
+            # Robust status parsing (regex “open-ish” vs “done-ish”)
+            status_text = df_scope.get("STATUS", pd.Series([""], index=df_scope.index)).astype(str).str.upper()
+            openish = status_text.str.contains(r'\bOPEN\b|ON[- ]?HOLD|IN[- ]?PROG|IN[- ]?PROCESS|PENDING', regex=True, na=False)
+            doneish = status_text.str.contains(r'\bCOMPLETE(D)?\b|CLOSED|RESOLVED|DONE', regex=True, na=False)
 
             today_ts = pd.Timestamp.today().normalize()
 
             # Buckets
-            is_completed   = done_dt.notna() | statusU.isin(DONE_STATUSES)
+            is_completed   = done_dt.notna() | doneish
             is_overdue     = (~is_completed) & due_dt.notna() & (due_dt < today_ts)
             # OPEN excludes future Start Date
-            is_open        = (~is_completed) & statusU.isin(OPEN_STATUSES) & (start_dt.isna() | (start_dt <= today_ts))
+            is_open        = (~is_completed) & openish & (start_dt.isna() | (start_dt <= today_ts))
             # Not Started = not completed & no Started On AND (no Start Date or Start Date in future)
             is_not_started = (~is_completed) & started_dt.isna() & (start_dt.isna() | (start_dt > today_ts))
+
+            # Quick status summary to see what's in scope
+            with st.expander("🔎 Status summary (in current scope)"):
+                st.write(status_text.value_counts(dropna=False).head(50))
 
             # Old threshold
             old_days = st.slider("Old threshold (days since Created On)", min_value=15, max_value=120, value=45, step=5)
@@ -620,6 +630,3 @@ else:
 
             with st.expander("🔎 Debug: sample of rows in scope"):
                 st.dataframe(df_scope.head(50), use_container_width=True)
-
-
-
