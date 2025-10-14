@@ -6,10 +6,9 @@
 # - Sidebar: choose page (History vs Work Orders)
 # - Top-of-page filters for Work Orders (Location, User, Team, View)
 # - Workorders_Master already includes: Location, IsOpen, IsOverdue, IsScheduled, IsCompleted, IsOld
-# - Never reveal assignments outside allowed locations; if a selected user has
-#   no WOs at the chosen location, show "User not found at this location."
+# - If a selected user has no WOs at a chosen location, show "User not found at this location..."
 # - Dates normalized to YYYY-MM-DD where needed
-# - Robust GitHub download + "Data last updated" from latest commit
+# - "Data last updated" from latest XLSX commit, displayed in ET
 # --------------------------------------------------------------
 
 from __future__ import annotations
@@ -23,7 +22,7 @@ import pandas as pd
 import streamlit as st
 import yaml
 
-APP_VERSION = "2025.10.14"
+APP_VERSION = "2025.10.14c"
 
 # ---------- deps ----------
 try:
@@ -44,7 +43,7 @@ st.set_page_config(page_title="SPF Work Orders", page_icon="🧰", layout="wide"
 # ---------- constants ----------
 SHEET_WORKORDERS     = "Workorders"         # history sheet (unchanged)
 SHEET_ASSET_MASTER   = "Asset_Master"
-SHEET_WO_MASTER      = "Workorders_Master"  # new listing sheet with flags
+SHEET_WO_MASTER      = "Workorders_Master"  # listing sheet with flags
 SHEET_USERS_CANDIDATES = ["Users", "Users]", "USERS", "users"]  # accept minor naming variations
 
 REQUIRED_WO_COLS = [
@@ -54,7 +53,7 @@ REQUIRED_WO_COLS = [
 OPTIONAL_SORT_COL = "Sort"       # if present, 1=WO, 2=PO, 3=TRANS
 ASSET_MASTER_COLS = ["Location", "ASSET"]
 
-# The canonical columns we expect in Workorders_Master now:
+# Expected columns in Workorders_Master now:
 MASTER_REQUIRED = [
     "ID","Title","Description","Asset","Status","Created on","Planned Start Date",
     "Due date","Started on","Completed on","Assigned to","Teams Assigned to",
@@ -138,11 +137,13 @@ def get_xlsx_bytes(cfg: dict) -> bytes:
     )
 
 def get_data_last_updated() -> str | None:
+    # Show latest XLSX commit time in ET
     gh = st.secrets.get("github") if hasattr(st, "secrets") else None
     if not gh or not gh.get("repo") or not gh.get("path"):
         return None
     try:
         import requests
+        from zoneinfo import ZoneInfo
         url = f"https://api.github.com/repos/{gh['repo']}/commits"
         params = {"path": gh["path"], "per_page": 1, "sha": gh.get("branch", "main")}
         headers = {"Accept": "application/vnd.github+json"}
@@ -150,9 +151,10 @@ def get_data_last_updated() -> str | None:
             headers["Authorization"] = f"token {gh['token']}"
         r = requests.get(url, headers=headers, params=params, timeout=20)
         r.raise_for_status()
-        iso = r.json()[0]["commit"]["committer"]["date"]
-        dt = datetime.fromisoformat(iso.replace("Z", "+00:00")).astimezone(timezone.utc)
-        return dt.strftime("Data last updated: %Y-%m-%d %H:%M UTC")
+        iso = r.json()[0]["commit"]["committer"]["date"]  # UTC Z
+        dt_utc = datetime.fromisoformat(iso.replace("Z", "+00:00"))
+        dt_et  = dt_utc.astimezone(ZoneInfo("America/New_York"))
+        return dt_et.strftime("Data last updated: %Y-%m-%d %H:%M ET")
     except Exception:
         return None
 
@@ -521,13 +523,9 @@ else:
 
         # Apply user filter but do NOT reveal if they have work at other locations
         if sel_user != "— Any user —":
-            before = len(df_scope)
             df_scope = df_scope[df_scope["Assigned to"].astype(str).str.strip() == sel_user].copy()
-            after = len(df_scope)
-            if after == 0:
-                # Intentionally vague: doesn't say they have work elsewhere
+            if df_scope.empty:
                 st.warning("User not found at this location (or no work orders match).")
-                # Show empty table with headers to keep layout stable
                 st.dataframe(df_scope, use_container_width=True, hide_index=True)
                 st.stop()
 
@@ -555,16 +553,16 @@ else:
 
         df_view = pick_view(df_scope)
 
-        # Choose minimal helpful columns per view
+        # Choose columns per view (include Description here per your request)
         def present(cols: list[str]) -> list[str]:
             return [c for c in cols if c in df_view.columns]
 
-        cols_all        = present(["ID","Title","Asset","Created on","Planned Start Date","Due date","Started on","Completed on","Assigned to","Teams Assigned to","Location"])
-        cols_open       = present(["ID","Title","Asset","Created on","Due date","Assigned to","Teams Assigned to","Location"])
-        cols_overdue    = present(["ID","Title","Asset","Due date","Assigned to","Teams Assigned to","Location"])
-        cols_sched      = present(["ID","Title","Asset","Planned Start Date","Due date","Assigned to","Teams Assigned to","Location"])
-        cols_completed  = present(["ID","Title","Asset","Completed on","Assigned to","Teams Assigned to","Location"])
-        cols_old        = present(["ID","Title","Asset","Created on","Due date","Completed on","Assigned to","Teams Assigned to","Location"])
+        cols_all        = present(["ID","Title","Description","Asset","Created on","Planned Start Date","Due date","Started on","Completed on","Assigned to","Teams Assigned to","Location"])
+        cols_open       = present(["ID","Title","Description","Asset","Created on","Due date","Assigned to","Teams Assigned to","Location"])
+        cols_overdue    = present(["ID","Title","Description","Asset","Due date","Assigned to","Teams Assigned to","Location"])
+        cols_sched      = present(["ID","Title","Description","Asset","Planned Start Date","Due date","Assigned to","Teams Assigned to","Location"])
+        cols_completed  = present(["ID","Title","Description","Asset","Completed on","Assigned to","Teams Assigned to","Location"])
+        cols_old        = present(["ID","Title","Description","Asset","Created on","Due date","Completed on","Assigned to","Teams Assigned to","Location"])
 
         if view == "Open":
             use_cols = cols_open or df_view.columns.tolist()
@@ -585,7 +583,7 @@ else:
             use_cols = cols_all or df_view.columns.tolist()
             sort_keys = [k for k in ["Completed on","Due date","Planned Start Date","Created on","Title"] if k in df_view.columns]
 
-        # Sort safely (dates already normalized as text YYYY-MM-DD; pandas sorts lexicographically OK)
+        # Sort safely (dates are YYYY-MM-DD strings -> lexicographic works)
         if sort_keys:
             df_view = df_view.sort_values(by=sort_keys, na_position="last")
 
@@ -608,5 +606,3 @@ else:
                 file_name=f"WorkOrders_{view.replace(' ','_')}.docx",
                 mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
             )
-
-
