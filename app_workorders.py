@@ -1,12 +1,12 @@
 # app_workorders.py
 # --------------------------------------------------------------
-# SPF Work Orders (reads local Workorders.xlsx by default)
-# Pages: Asset History • Work Orders • Service Report • Service History • Procedures Xref (optional)
-# Date-only display everywhere • Privacy by Location
+# SPF Work Orders (reads Workorders.xlsx from the same repo folder)
+# Pages: Asset History • Work Orders • Service Report • Service History
+# Privacy-safe by Location; Dates normalized where appropriate
 # --------------------------------------------------------------
 
 from __future__ import annotations
-import io, re, os
+import io, re
 from pathlib import Path
 from collections.abc import Mapping
 from datetime import datetime, timedelta, timezone
@@ -14,23 +14,9 @@ from datetime import datetime, timedelta, timezone
 import pandas as pd
 import streamlit as st
 import yaml
+from zipfile import BadZipFile
 
-APP_VERSION = "2025.10.15k"
-
-# ---------- CSS ----------
-st.set_page_config(page_title="SPF Work Orders", page_icon="🧰", layout="wide")
-st.markdown(
-    """
-    <style>
-      .stDeployButton, footer, header {visibility: hidden;}
-      [data-testid="stDecoration"] {display:none;}
-      .viewerBadge_container__E0v7 {display:none !important;}
-      div[data-baseweb="select"] > div {min-height: 34px;}
-      label[for] {margin-bottom: 2px;}
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
+APP_VERSION = "2025.10.15g-local"
 
 # ---------- deps ----------
 try:
@@ -46,29 +32,39 @@ except Exception:
     st.error("python-docx not installed. Add it to requirements.txt")
     st.stop()
 
+st.set_page_config(page_title="SPF Work Orders", page_icon="🧰", layout="wide")
+
+# Light CSS: slimmer selectboxes & hide Streamlit Cloud manage badge/footer
+st.markdown("""
+<style>
+/* tighter selectboxes */
+div[data-baseweb="select"] > div { min-height: 34px; }
+label span { font-size: 0.85rem; }
+/* Hide Streamlit Cloud 'Manage app' */
+footer, #MainMenu {visibility: hidden;}
+.stDeployButton, .stAppDeployButton {display:none !important;}
+/* Badge container name changes over time; try to hide generically */
+div[class*="viewerBadge"], a[title="Manage app"] {display:none !important;}
+</style>
+""", unsafe_allow_html=True)
+
 # ---------- constants ----------
-LOCAL_XLSX_DEFAULT = "Workorders.xlsx"
+# Sheet names in your current workbook
+SHEET_WORKORDERS   = "Workorders"                  # history sheet
+SHEET_ASSET_MASTER = "Asset_Master"
+SHEET_WO_MASTER    = "Workorders_Master"           # listing sheet with flags
 
-SHEET_WORKORDERS         = "Workorders"
-SHEET_ASSET_MASTER       = "Asset_Master"
-SHEET_WO_MASTER          = "Workorders_Master"
-
-SHEET_WO_SERVICE_CANDS   = [
+# Service History sheet names (try these in order)
+SHEET_WO_SERVICE_CANDS = [
     "Workorders_Master_Services",
     "Workorders_Master_service",
     "Workorders_Master_Service",
-    "Workorders Service",
-    "Service History"
 ]
 
+# Service Report sheet names (try these in order)
 SHEET_SERVICE_CANDIDATES = ["Service Report", "Service_Report", "ServiceReport"]
-SHEET_USERS_CANDIDATES   = ["Users", "Users]", "USERS", "users"]
 
-# Optional procedures/filters (same workbook or external files)
-PROC_SHEET_CANDS         = ["Service_Procedures", "Procedures"]
-PROCFILT_SHEET_CANDS     = ["Service_Procedures_Filters", "Service_Filters"]
-PROC_FILE                = "service_procedures.xlsx"
-PROCFILT_FILE            = "service_filters.xlsx"
+SHEET_USERS_CANDIDATES   = ["Users", "Users]", "USERS", "users"]
 
 REQUIRED_WO_COLS = [
     "WORKORDER","TITLE","STATUS","PO","P/N","QUANTITY RECEIVED",
@@ -82,38 +78,6 @@ MASTER_REQUIRED = [
     "Due date","Started on","Completed on","Assigned to","Teams Assigned to",
     "Completed by","Location","IsOpen","IsOverdue","IsScheduled","IsCompleted","IsOld"
 ]
-
-SERVICE_REPORT_CANON = {
-    "WO_ID":{"workorder","wo","work order","work order id","id","wo id"},
-    "Title":{"title","name"},
-    "Service":{"service","procedure","procedure name","task","step","line item"},
-    "Asset":{"asset","asset name"},
-    "Location":{"location","ns location","location2"},
-    "Date":{"date","completed on","performed on","service date","closed on"},
-    "User":{"user","technician","completed by","performed by","assigned to"},
-    "Notes":{"notes","description","comment","comments","details"},
-    "Status":{"status"},
-    "Schedule":{"schedule","interval","frequency","meter interval","planned interval","cycle"},
-    "Remaining":{"remaining","remaining value","units remaining","miles remaining","hours remaining","reading remaining","remaining units"},
-    "Percent Remaining":{"percent remaining","% remaining","remaining %","remaining pct","pct remaining"},
-    "Meter Type":{"meter type","type","uom","unit","units"},
-    "Due Date":{"due date","next due","target date","next service date"},
-    "MReading":{"mreading","meter reading","reading at service","reading"},
-}
-
-SERVICE_HISTORY_CANON = {
-    "WO_ID":{"id","wo","workorder","work order","workorder id"},
-    "Title":{"title"},
-    "Service":{"service type","service","procedure name","procedure","task"},
-    "Asset":{"asset","asset name"},
-    "Location2":{"location2","location","ns location"},
-    "Date":{"completed on","performed on","date","service date"},
-    "User":{"completed by","technician","assigned to","performed by","user"},
-    "Notes":{"notes","description","comment","comments","details"},
-    "Status":{"status"},
-    "MReading":{"mreading","meter reading","reading at service","reading"},
-    "MHours":{"mhours","hours at service","hours"},
-}
 
 # ---------- helpers ----------
 def to_plain(obj):
@@ -142,6 +106,10 @@ def load_config() -> dict:
             return {}
     return {}
 
+def _norm_key(x: str) -> str:
+    s = re.sub(r"[^0-9a-z]+", " ", str(x).lower())
+    return re.sub(r"\s+", " ", s).strip()
+
 def _norm_date_any(s: str) -> str:
     s = (str(s) if s is not None else "").strip()
     if not s:
@@ -156,45 +124,6 @@ def _norm_date_any(s: str) -> str:
         return "" if pd.isna(dt) else dt.strftime("%Y-%m-%d")
     except Exception:
         return s
-
-def _norm_key(x: str) -> str:
-    s = re.sub(r"[^0-9a-z]+", " ", str(x).lower())
-    return re.sub(r"\s+", " ", s).strip()
-
-def _canonize_headers(df: pd.DataFrame, canon: dict[str, set[str]]) -> pd.DataFrame:
-    low_to_orig = {str(c).strip().lower(): str(c) for c in df.columns}
-    mapping = {}
-    for key, aliases in canon.items():
-        key_l = key.lower()
-        if key_l in low_to_orig:
-            mapping[low_to_orig[key_l]] = key
-            continue
-        for low, orig in low_to_orig.items():
-            low2 = re.sub(r"\s+", " ", low)
-            if low in aliases or low2 in aliases:
-                mapping[orig] = key
-                break
-    return df.rename(columns=mapping)
-
-# --- date-only formatter for display ---
-_DATE_HINTS = {
-    "date","completed on","due date","planned start date","started on","start date",
-    "next service","date of last service","service date","performed on"
-}
-def _format_dateish_cols(df: pd.DataFrame) -> pd.DataFrame:
-    """Convert any date-like columns to YYYY-MM-DD for display."""
-    out = df.copy()
-    for c in out.columns:
-        lc = str(c).lower()
-        if any(h in lc for h in _DATE_HINTS):
-            try:
-                s = pd.to_datetime(out[c], errors="coerce")
-                mask = s.notna()
-                if mask.any():
-                    out.loc[mask, c] = s.dt.date.astype(str)
-            except Exception:
-                pass
-    return out
 
 def to_xlsx_bytes(df: pd.DataFrame, sheet: str) -> bytes:
     import xlsxwriter
@@ -214,35 +143,73 @@ def to_docx_bytes(df: pd.DataFrame, title: str) -> bytes:
     doc.styles["Normal"].font.size = Pt(10)
     doc.add_heading(title, level=1)
     rows, cols = len(df)+1, len(df.columns)
-    tbl = doc.add_table(rows=rows, cols=cols); tbl.style = "Table Grid"
-    for j, c in enumerate(df.columns): tbl.cell(0, j).text = str(c)
+    tbl = doc.add_table(rows=rows, cols=cols)
+    tbl.style = "Table Grid"
+    for j, c in enumerate(df.columns):
+        tbl.cell(0, j).text = str(c)
     for i, (_, r) in enumerate(df.iterrows(), start=1):
         for j, c in enumerate(df.columns):
-            v = "" if pd.isna(r[c]) else str(r[c]); tbl.cell(i, j).text = v
-    out = io.BytesIO(); doc.save(out); return out.getvalue()
+            v = "" if pd.isna(r[c]) else str(r[c])
+            tbl.cell(i, j).text = v
+    out = io.BytesIO()
+    doc.save(out)
+    return out.getvalue()
 
 def coerce_bool(s: pd.Series) -> pd.Series:
-    if s.dtype == bool: return s
+    if s.dtype == bool:
+        return s
     m = s.astype(str).str.strip().str.lower()
     true_vals  = {"true","yes","y","1","t"}
     false_vals = {"false","no","n","0","f","", "nan", "none"}
     out = m.map(lambda x: True if x in true_vals else (False if x in false_vals else False))
     return out.astype(bool)
 
-# ---------- data access ----------
-def get_local_xlsx_bytes(cfg: dict) -> bytes:
-    xl = (cfg.get("settings", {}) or {}).get("xlsx_path") or LOCAL_XLSX_DEFAULT
-    p = Path(xl)
-    if not p.exists():
-        raise FileNotFoundError(f"Local Excel not found: {p.resolve()}")
-    return p.read_bytes()
+# ---------- data bytes (local first) ----------
+def get_xlsx_bytes(cfg: dict) -> bytes:
+    # 1) use settings.xlsx_path if provided
+    xlsx_path = (cfg.get("settings", {}) or {}).get("xlsx_path")
+    here = Path(__file__).resolve().parent
+    if not xlsx_path:
+        # 2) default to 'Workorders.xlsx' next to this script
+        xlsx_path = str(here / "Workorders.xlsx")
+    p = Path(xlsx_path)
+    if p.exists():
+        return p.read_bytes()
 
-def get_data_last_updated_local(cfg: dict) -> str | None:
-    xl = (cfg.get("settings", {}) or {}).get("xlsx_path") or LOCAL_XLSX_DEFAULT
+    # 3) (Optional) fallback to GitHub secrets if local missing
+    gh = st.secrets.get("github") if hasattr(st, "secrets") else None
+    if not gh:
+        raise FileNotFoundError(f"Excel not found locally at: {p}. Provide settings.xlsx_path or place Workorders.xlsx next to app.")
+    # GH download
+    import requests
+    def _headers(raw: bool = True):
+        h = {"Accept": "application/vnd.github.v3.raw" if raw else "application/vnd.github+json"}
+        if gh.get("token"):
+            h["Authorization"] = f"token {gh['token']}"
+        return h
+    url1 = f"https://api.github.com/repos/{gh.get('repo')}/contents/{gh.get('path')}?ref={gh.get('branch','main')}"
+    r1 = requests.get(url1, headers=_headers(raw=True), timeout=30)
+    if r1.status_code == 200:
+        data = r1.content
+    else:
+        url2 = f"https://raw.githubusercontent.com/{gh.get('repo')}/{gh.get('branch','main')}/{gh.get('path')}"
+        r2 = requests.get(url2, headers=_headers(raw=True), timeout=30)
+        if r2.status_code != 200:
+            snippet1 = (r1.text or "")[:200]
+            snippet2 = (r2.text or "")[:200]
+            raise RuntimeError(f"GitHub download failed.\nContents API ({r1.status_code}): {snippet1}\nRaw URL ({r2.status_code}): {snippet2}")
+        data = r2.content
+    if not data or len(data) < 100:
+        raise RuntimeError("Downloaded file is unexpectedly small. Check repo/path/branch/token.")
+    head = data[:128].lstrip()
+    if head.startswith(b"{") or b"<html" in head.lower():
+        raise RuntimeError("Got JSON/HTML instead of raw Excel. Check repo/path/branch/token.")
+    return data
+
+def get_data_last_updated_local(path: Path) -> str | None:
     try:
-        from zoneinfo import ZoneInfo
-        ts = datetime.fromtimestamp(os.path.getmtime(xl), tz=timezone.utc).astimezone(ZoneInfo("America/New_York"))
-        return ts.strftime("Data last updated: %Y-%m-%d %H:%M ET")
+        ts = datetime.fromtimestamp(path.stat().st_mtime)
+        return ts.strftime("Data last updated (local): %Y-%m-%d %H:%M")
     except Exception:
         return None
 
@@ -267,9 +234,9 @@ def load_workorders_df(xlsx_bytes: bytes, sheet: str) -> pd.DataFrame:
 def load_asset_master_df(xlsx_bytes: bytes, sheet: str) -> pd.DataFrame:
     df = pd.read_excel(io.BytesIO(xlsx_bytes), sheet_name=sheet, dtype=str, keep_default_na=False, engine="openpyxl")
     df.columns = [str(c).strip() for c in df.columns]
-    for c in ASSET_MASTER_COLS:
-        if c not in df.columns:
-            raise ValueError(f"Sheet '{sheet}' missing '{c}'")
+    missing = [c for c in ASSET_MASTER_COLS if c not in df.columns]
+    if missing:
+        raise ValueError(f"Sheet '{sheet}' missing columns: {missing}\nFound: {list(df.columns)}")
     for c in ASSET_MASTER_COLS:
         df[c] = df[c].map(lambda x: x.strip() if isinstance(x, str) else x)
     df = df[(df["Location"] != "") & (df["ASSET"] != "")]
@@ -295,31 +262,36 @@ def load_wo_master_df(xlsx_bytes: bytes, sheet: str) -> pd.DataFrame:
     return df
 
 @st.cache_data(show_spinner=False)
+def load_users_sheet(xlsx_bytes: bytes) -> list[str] | None:
+    for name in SHEET_USERS_CANDIDATES:
+        try:
+            dfu = pd.read_excel(io.BytesIO(xlsx_bytes), sheet_name=name, dtype=str, keep_default_na=False, engine="openpyxl")
+            cols_low = {c.lower(): c for c in dfu.columns}
+            col = cols_low.get("user")
+            if not col:
+                continue
+            users = [u.strip() for u in dfu[col].astype(str).tolist() if str(u).strip()]
+            users = sorted(dict.fromkeys(users))
+            return users
+        except Exception:
+            pass
+    return None
+
+# Service Report loader (raw only; we’ll format specific columns for display later)
+@st.cache_data(show_spinner=False)
 def load_service_report_df(xlsx_bytes: bytes):
+    last_err = None
     for nm in SHEET_SERVICE_CANDIDATES:
         try:
             raw = pd.read_excel(io.BytesIO(xlsx_bytes), sheet_name=nm, dtype=str, keep_default_na=False, engine="openpyxl")
             raw.columns = [str(c).strip() for c in raw.columns]
-            canon = _canonize_headers(raw.copy(), SERVICE_REPORT_CANON)
-            if "Date" in canon.columns: canon["Date"] = canon["Date"].map(_norm_date_any)
-            if "Due Date" in canon.columns: canon["Due Date"] = canon["Due Date"].map(_norm_date_any)
-            for col, newcol in [("Schedule","__Schedule_num"), ("Remaining","__Remaining_num"), ("Percent Remaining","__PctRemain_num")]:
-                if col in canon.columns:
-                    canon[newcol] = pd.to_numeric(canon[col].astype(str).str.replace("%","", regex=False), errors="coerce")
-                else:
-                    canon[newcol] = pd.NA
-            if "__PctRemain_num" in canon.columns:
-                pr = pd.to_numeric(canon["__PctRemain_num"], errors="coerce")
-                canon["__PctRemain_num"] = pr.where((pr.isna()) | (pr <= 1.0), pr/100.0)
-            canon["__MeterType_norm"] = canon.get("Meter Type", pd.Series([], dtype=str)).astype(str).str.strip().str.lower() if "Meter Type" in canon.columns else ""
-            canon["__Due_dt"] = pd.to_datetime(canon["Due Date"], errors="coerce") if "Due Date" in canon.columns else pd.NaT
-            for c in [x for x in ["WO_ID","Title","Service","Asset","Location","User","Notes","Status","MReading"] if x in canon.columns]:
-                canon[c] = canon[c].astype(str).str.strip()
-            return raw, canon, nm
-        except Exception:
+            return raw, nm
+        except Exception as e:
+            last_err = e
             continue
-    return None, None, None
+    return None, f"{last_err}" if last_err else None
 
+# Service History loader (Location2)
 @st.cache_data(show_spinner=False)
 def load_service_history_df(xlsx_bytes: bytes):
     last_err = None
@@ -327,11 +299,23 @@ def load_service_history_df(xlsx_bytes: bytes):
         try:
             df = pd.read_excel(io.BytesIO(xlsx_bytes), sheet_name=nm, dtype=str, keep_default_na=False, engine="openpyxl")
             df.columns = [str(c).strip() for c in df.columns]
-            df = _canonize_headers(df, SERVICE_HISTORY_CANON)
-            if "Date" in df.columns: df["Date"] = df["Date"].map(_norm_date_any)
-            for c in [x for x in ["WO_ID","Title","Service","Asset","Location2","User","Notes","Status","MReading","MHours"] if x in df.columns]:
+            # Normalize key columns (your provided header set)
+            rename = {
+                "ID":"WO_ID",
+                "Completed on":"Date",
+                "Service Type":"Service",
+                "Location2":"Location2",
+                "MReading":"MReading",
+                "MHours":"MHours",
+            }
+            for k,v in rename.items():
+                if k in df.columns:
+                    df = df.rename(columns={k:v})
+            if "Date" in df.columns:
+                df["Date"] = df["Date"].map(_norm_date_any)
+            for c in [x for x in ["WO_ID","Title","Service","Asset","User","Notes","Status","Location2","MReading","MHours"] if x in df.columns]:
                 df[c] = df[c].astype(str).str.strip()
-            keep = [c for c in ["Date","WO_ID","Title","Service","MReading","MHours","Asset","User","Location2","Notes","Status"] if c in df.columns]
+            keep = [c for c in ["Date","WO_ID","Title","Service","MReading","MHours","Asset","Location2"] if c in df.columns]
             df = df[keep].copy() if keep else df
             return df, nm
         except Exception as e:
@@ -339,58 +323,11 @@ def load_service_history_df(xlsx_bytes: bytes):
             continue
     return None, f"{last_err}" if last_err else None
 
-# Optional Procedures / Filters
-@st.cache_data(show_spinner=False)
-def load_procedures_and_filters(xlsx_bytes: bytes):
-    proc_df = None; filt_df = None
-
-    # External files take precedence
-    if Path(PROC_FILE).exists():
-        try:
-            proc_df = pd.read_excel(PROC_FILE, dtype=str, keep_default_na=False, engine="openpyxl")
-        except Exception:
-            pass
-    if Path(PROCFILT_FILE).exists():
-        try:
-            filt_df = pd.read_excel(PROCFILT_FILE, dtype=str, keep_default_na=False, engine="openpyxl")
-        except Exception:
-            pass
-
-    # Otherwise, try sheets in the main workbook
-    if proc_df is None:
-        for nm in PROC_SHEET_CANDS:
-            try:
-                proc_df = pd.read_excel(io.BytesIO(xlsx_bytes), sheet_name=nm, dtype=str, keep_default_na=False, engine="openpyxl")
-                break
-            except Exception:
-                continue
-    if filt_df is None:
-        for nm in PROCFILT_SHEET_CANDS:
-            try:
-                filt_df = pd.read_excel(io.BytesIO(xlsx_bytes), sheet_name=nm, dtype=str, keep_default_na=False, engine="openpyxl")
-                break
-            except Exception:
-                continue
-
-    # Canonicalize a 'ServiceKey' for joining if possible
-    def canon_service_col(df):
-        if df is None: return None
-        df = df.copy()
-        cols = {c.lower(): c for c in df.columns}
-        for want in ["service","service type","procedure","procedure name"]:
-            if want in cols:
-                df["ServiceKey"] = df[cols[want]].astype(str).str.strip()
-                return df
-        # if not found, leave as-is
-        return df
-
-    proc_df = canon_service_col(proc_df)
-    filt_df = canon_service_col(filt_df)
-    return proc_df, filt_df
-
 # ---------- App ----------
 st.sidebar.caption(f"SPF Work Orders — v{APP_VERSION}")
-cfg = to_plain(load_config())
+
+cfg = load_config()
+cfg = to_plain(cfg)
 
 # Auth
 cookie_cfg = cfg.get("cookie", {})
@@ -400,6 +337,7 @@ auth = stauth.Authenticate(
     cookie_cfg.get("key", "super_secret_key"),
     cookie_cfg.get("expiry_days", 7),
 )
+
 name, auth_status, username = auth.login("Login", "main")
 
 if auth_status is False:
@@ -410,8 +348,16 @@ else:
     auth.logout("Logout", "sidebar")
     st.sidebar.success(f"Logged in as {name}")
 
-    updated = get_data_last_updated_local(cfg)
-    if updated: st.sidebar.caption(updated)
+    # Load workbook bytes (local first)
+    try:
+        xlsx_bytes = get_xlsx_bytes(cfg)
+        # show local updated timestamp if local path exists
+        p = Path((cfg.get("settings", {}) or {}).get("xlsx_path") or (Path(__file__).resolve().parent / "Workorders.xlsx"))
+        if p.exists():
+            st.sidebar.caption(get_data_last_updated_local(p) or "")
+    except Exception as e:
+        st.error(f"Could not load Excel: {e}")
+        st.stop()
 
     if st.sidebar.button("🔄 Refresh data"):
         st.cache_data.clear()
@@ -419,20 +365,16 @@ else:
 
     page = st.sidebar.radio(
         "Page",
-        ["🔎 Asset History", "📋 Work Orders", "🧾 Service Report", "📚 Service History", "⚙️ Procedures Xref"],
+        ["🔎 Asset History", "📋 Work Orders", "🧾 Service Report", "📚 Service History"],
         index=1
     )
 
-    # Load workbook bytes
-    try:
-        xlsx_bytes = get_local_xlsx_bytes(cfg)
-    except Exception as e:
-        st.error(f"Could not load Excel: {e}")
-        st.stop()
-
-    # Access control: Locations from Asset_Master
+    # Access control: Locations
     try:
         df_am = load_asset_master_df(xlsx_bytes, SHEET_ASSET_MASTER)
+    except BadZipFile:
+        st.error("The downloaded file isn’t a valid .xlsx.")
+        st.stop()
     except Exception as e:
         st.error(f"Failed to read Asset_Master: {e}")
         st.stop()
@@ -440,10 +382,12 @@ else:
     username_ci = str(username).casefold()
     admins_ci = {str(u).casefold() for u in (cfg.get("access", {}).get("admin_usernames", []) or [])}
     is_admin = username_ci in admins_ci
+
     ul_raw = (cfg.get("access", {}).get("user_locations", {}) or {})
     ul_map_ci = {str(k).casefold(): v for k, v in ul_raw.items()}
     allowed_cfg = ul_map_ci.get(username_ci, [])
-    if isinstance(allowed_cfg, str): allowed_cfg = [allowed_cfg]
+    if isinstance(allowed_cfg, str):
+        allowed_cfg = [allowed_cfg]
     allowed_cfg = [a for a in (allowed_cfg or [])]
     star = any(str(a).strip() == "*" for a in allowed_cfg)
 
@@ -456,21 +400,24 @@ else:
         st.markdown("### Asset History")
         c1, c2 = st.columns([2, 3])
         with c1:
-            loc_options = sorted(allowed_locations)
-            chosen_loc = st.selectbox("Location", options=loc_options, index=0, label_visibility="collapsed")
+            chosen_loc = st.selectbox("Location", options=sorted(allowed_locations), index=0, key="ah_loc")
         with c2:
             assets_for_loc = sorted(df_am.loc[df_am["Location"] == chosen_loc, "ASSET"].dropna().unique().tolist())
-            chosen_asset = st.selectbox("Asset", options=assets_for_loc, index=0 if assets_for_loc else None, label_visibility="collapsed")
+            chosen_asset = st.selectbox("Asset", options=assets_for_loc, index=0 if assets_for_loc else None, key="ah_asset")
 
         if not assets_for_loc:
-            st.info("No assets for this Location."); st.stop()
+            st.info("No assets for this Location.")
+            st.stop()
 
         try:
             df_all = load_workorders_df(xlsx_bytes, SHEET_WORKORDERS)
         except Exception as e:
-            st.error(f"Failed to read Workorders (history): {e}"); st.stop()
+            st.error(f"Failed to read Workorders (history): {e}")
+            st.stop()
 
         df = df_all[(df_all["Location"] == chosen_loc) & (df_all["ASSET"] == chosen_asset)].copy()
+
+        # Remove negative/zero part transactions
         if "QUANTITY RECEIVED" in df.columns and "P/N" in df.columns:
             qnum = pd.to_numeric(df["QUANTITY RECEIVED"], errors="coerce")
             is_part = df["P/N"].astype(str).str.strip().ne("")
@@ -483,18 +430,19 @@ else:
             df["__sort_key"] = 1
         df.sort_values(by=["WORKORDER","__sort_key","__row"], ascending=[True, True, True], inplace=True)
         df.loc[df["__sort_key"].isin([2, 3]), "WORKORDER"] = ""
+
         drop_cols = ["__row","__sort_key", OPTIONAL_SORT_COL]
         df_out = df.drop(columns=[c for c in drop_cols if c in df.columns], errors="ignore")
 
-        st.dataframe(_format_dateish_cols(df_out), use_container_width=True, hide_index=True)
+        st.dataframe(df_out, use_container_width=True, hide_index=True)
 
         c1, c2, _ = st.columns([1, 1, 6])
         with c1:
-            st.download_button("⬇️ Excel (.xlsx)", data=to_xlsx_bytes(_format_dateish_cols(df_out), sheet="Workorders"),
+            st.download_button("⬇️ Excel (.xlsx)", data=to_xlsx_bytes(df_out, sheet="Workorders"),
                                file_name=f"WorkOrders_{chosen_loc}_{chosen_asset}.xlsx".replace(" ","_"),
                                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
         with c2:
-            st.download_button("⬇️ Word (.docx)", data=to_docx_bytes(_format_dateish_cols(df_out), title=f"Work Orders — {chosen_loc} — {chosen_asset}"),
+            st.download_button("⬇️ Word (.docx)", data=to_docx_bytes(df_out, title=f"Work Orders — {chosen_loc} — {chosen_asset}"),
                                file_name=f"WorkOrders_{chosen_loc}_{chosen_asset}.docx".replace(" ","_"),
                                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
         st.stop()
@@ -506,9 +454,11 @@ else:
         try:
             df_master = load_wo_master_df(xlsx_bytes, SHEET_WO_MASTER)
         except Exception as e:
-            st.error(f"Failed to read '{SHEET_WO_MASTER}': {e}"); st.stop()
+            st.error(f"Failed to read '{SHEET_WO_MASTER}': {e}")
+            st.stop()
 
-        opt_users = load_users_sheet(xlsx_bytes=None)  # optional, harmless if None
+        opt_users = load_users_sheet(xlsx_bytes)  # <-- fixed (pass real bytes)
+
         df_master = df_master[df_master["Location"].isin(allowed_locations)].copy()
         total_in_scope = len(df_master)
 
@@ -516,8 +466,7 @@ else:
         with c1:
             loc_values = sorted(df_master["Location"].dropna().unique().tolist())
             loc_all_label = f"« All my locations ({len(loc_values)}) »"
-            chosen_loc = st.selectbox("Location", options=[loc_all_label] + loc_values, index=0, label_visibility="collapsed")
-
+            chosen_loc = st.selectbox("Location", options=[loc_all_label] + loc_values, index=0, key="wo_loc")
         df_scope = df_master if chosen_loc == loc_all_label else df_master[df_master["Location"] == chosen_loc].copy()
 
         with c2:
@@ -526,7 +475,7 @@ else:
             else:
                 derived_users = sorted([u for u in df_scope.get("Assigned to", pd.Series([], dtype=str)).dropna().astype(str).str.strip().unique().tolist() if u])
                 user_choices = ["— Any user —"] + derived_users
-            sel_user = st.selectbox("Assigned user", options=user_choices, index=0, label_visibility="collapsed")
+            sel_user = st.selectbox("Assigned user", options=user_choices, index=0, key="wo_user")
 
         with c3:
             raw_teams = df_scope.get("Teams Assigned to", pd.Series([], dtype=str)).fillna("").astype(str)
@@ -537,17 +486,18 @@ else:
                     if t:
                         token_set.add(t)
             team_opts = ["— Any team —"] + sorted(token_set)
-            sel_team = st.selectbox("Team", options=team_opts, index=0, label_visibility="collapsed")
+            sel_team = st.selectbox("Team", options=team_opts, index=0, key="wo_team")
 
         with c4:
-            view = st.radio("View", ["All","Open","Overdue","Scheduled (Planning)","Completed","Old"],
-                            horizontal=True, index=1 if "IsOpen" in df_scope.columns else 0)
+            view = st.radio("View", ["All","Open","Overdue","Scheduled (Planning)","Completed","Old"], horizontal=True,
+                            index=1 if "IsOpen" in df_scope.columns else 0, key="wo_view")
 
         if sel_user != "— Any user —":
             df_scope = df_scope[df_scope["Assigned to"].astype(str).str.strip() == sel_user].copy()
             if df_scope.empty:
                 st.warning("User not found at this location (or no work orders match).")
-                st.dataframe(df_scope, use_container_width=True, hide_index=True); st.stop()
+                st.dataframe(df_scope, use_container_width=True, hide_index=True)
+                st.stop()
 
         if sel_team != "— Any team —":
             def team_hit(s: str) -> bool:
@@ -593,11 +543,11 @@ else:
             use_cols = cols_all or df_view.columns.tolist()
             sort_keys = [k for k in ["Completed on","Due date","Planned Start Date","Created on","Title"] if k in df_view.columns]
 
-        if sort_keys: df_view = df_view.sort_values(by=sort_keys, na_position="last")
-        show_tbl = _format_dateish_cols(df_view[use_cols])
+        if sort_keys:
+            df_view = df_view.sort_values(by=sort_keys, na_position="last")
 
         st.caption(f"In scope: {total_in_scope}  •  After location/user/team filters: {len(df_scope)}  •  Showing ({view}): {len(df_view)}")
-        st.dataframe(show_tbl, use_container_width=True, hide_index=True)
+        st.dataframe(df_view[use_cols], use_container_width=True, hide_index=True)
 
         with st.expander("🗓️ 7-day Scheduled Planner (printable)", expanded=False):
             df_sched = df_scope[df_scope.get("IsScheduled", False)].copy()
@@ -621,11 +571,11 @@ else:
 
         c1, c2, _ = st.columns([1, 1, 6])
         with c1:
-            st.download_button("⬇️ Excel (.xlsx)", data=to_xlsx_bytes(show_tbl, sheet="WorkOrders"),
+            st.download_button("⬇️ Excel (.xlsx)", data=to_xlsx_bytes(df_view[use_cols], sheet="WorkOrders"),
                                file_name=f"WorkOrders_{view.replace(' ','_')}.xlsx",
                                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
         with c2:
-            st.download_button("⬇️ Word (.docx)", data=to_docx_bytes(show_tbl, title=f"Work Orders — {view}"),
+            st.download_button("⬇️ Word (.docx)", data=to_docx_bytes(df_view[use_cols], title=f"Work Orders — {view}"),
                                file_name=f"WorkOrders_{view.replace(' ','_')}.docx",
                                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
         st.stop()
@@ -633,136 +583,151 @@ else:
     # ========= Service Report =========
     if page == "🧾 Service Report":
         st.markdown("### Service Report")
-
-        raw_sr, canon_sr, source_sheet = load_service_report_df(xlsx_bytes)
+        raw_sr, source_sheet_or_err = load_service_report_df(xlsx_bytes)
         if raw_sr is None:
-            st.warning("No 'Service Report' sheet found."); st.stop()
+            st.warning(f"No 'Service Report' sheet found. Last error: {source_sheet_or_err}")
+            st.stop()
 
         # Location filter (shorter)
-        loc_col = None
-        for c in raw_sr.columns:
-            if c.strip().lower() in {"location","ns location","location2"}:
-                loc_col = c; break
+        # Allow matching on Location or Location2 variants
+        possible_loc_cols = [c for c in raw_sr.columns if c.strip().lower() in {"location","ns location","location2"}]
+        loc_col = possible_loc_cols[0] if possible_loc_cols else None
 
         if loc_col:
             loc_values_all = raw_sr[loc_col].astype(str)
-            loc_candidates = sorted({v for v in loc_values_all if _norm_key(v) in allowed_norms})
+            # in-scope only
+            loc_values = sorted([v for v in loc_values_all.unique().tolist() if _norm_key(v) in allowed_norms])
         else:
-            loc_candidates = sorted(allowed_locations)
+            loc_values = sorted(allowed_locations)
 
-        c_loc, _ = st.columns([3, 7])
-        with c_loc:
-            loc_all_label = f"« All my locations ({len(loc_candidates)}) »" if loc_candidates else "« All my locations »"
-            chosen_loc = st.selectbox("Location", options=[loc_all_label] + loc_candidates if loc_candidates else [loc_all_label],
-                                      index=0, label_visibility="collapsed")
+        c1, = st.columns([3])
+        loc_all_label = f"« All my locations ({len(loc_values)}) »" if loc_values else "« All my locations »"
+        chosen_loc = st.selectbox("Location", options=[loc_all_label] + loc_values if loc_values else [loc_all_label],
+                                  index=0, key="sr_loc", label_visibility="collapsed")
+        st.caption("Location")
 
         if loc_col and chosen_loc != loc_all_label:
-            mask_norm = loc_values_all.map(_norm_key) == _norm_key(chosen_loc)
-            raw_show = raw_sr[mask_norm].copy()
-            if "Location" in canon_sr.columns:
-                canon_in_scope = canon_sr[canon_sr["Location"].map(_norm_key) == _norm_key(chosen_loc)].copy()
-            else:
-                canon_in_scope = canon_sr.copy()
+            mask = loc_values_all.map(_norm_key) == _norm_key(chosen_loc)
+            raw_show = raw_sr[mask].copy()
         else:
             raw_show = raw_sr.copy()
-            canon_in_scope = canon_sr.copy()
 
+        # ---- Tabs
         t_report, t_due, t_over = st.tabs(["Report", "Coming Due", "Overdue"])
 
-        # --- Report (as-is, minus Schedule/Today, date-only) ---
+        # Helper: return date-only formatted copy of a column if it truly parses as datetime
+        def _date_only_if_datetime(df: pd.DataFrame, col: str) -> pd.Series:
+            if col not in df.columns:
+                return df.get(col)
+            s = df[col].astype(str).str.strip()
+            parsed = pd.to_datetime(s, errors="coerce")
+            if parsed.notna().any():
+                out = s.copy()
+                out.loc[parsed.notna()] = parsed.dropna().dt.strftime("%Y-%m-%d")
+                return out
+            return df[col]
+
+        # --- Report (as-is but hide Schedule/Today and force Last Reading to date-only if it's datetime)
         with t_report:
-            drop_cols = [c for c in ["Schedule","Today"] if c in raw_show.columns]
-            show_rep = raw_show.drop(columns=drop_cols) if drop_cols else raw_show
-            show_rep = _format_dateish_cols(show_rep)  # <-- force date-only
-            st.caption(f"Source: {source_sheet}  •  Rows: {len(show_rep)}  •  No filters other than Location.")
-            st.dataframe(show_rep, use_container_width=True, hide_index=True)
+            show = raw_show.copy()
+            # Last Reading: only change if it looks like a datetime column
+            if "Last Reading" in show.columns:
+                show["Last Reading"] = _date_only_if_datetime(show, "Last Reading")
+            # Hide Schedule and Today
+            show = show.drop(columns=[c for c in ["Schedule","Today"] if c in show.columns], errors="ignore")
+            st.caption(f"Source: {source_sheet_or_err} • Rows: {len(show)} • Only Location filter applied.")
+            st.dataframe(show, use_container_width=True, hide_index=True)
+
             c1, c2, _ = st.columns([1,1,6])
             with c1:
-                st.download_button("⬇️ Excel (.xlsx)", data=to_xlsx_bytes(show_rep, sheet="Service_Report"),
+                st.download_button("⬇️ Excel (.xlsx)", data=to_xlsx_bytes(show, sheet="Service_Report"),
                                    file_name="Service_Report.xlsx",
                                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
             with c2:
-                st.download_button("⬇️ Word (.docx)", data=to_docx_bytes(show_rep, title="Service Report — As Is"),
+                st.download_button("⬇️ Word (.docx)", data=to_docx_bytes(show, title="Service Report — As Is"),
                                    file_name="Service_Report.docx",
                                    mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
 
-        # Coming Due / Overdue (already normalized in canon; still run formatter for safety)
-        def _due_frames(df_can: pd.DataFrame):
-            if df_can is None or df_can.empty:
+        # ---- Coming Due / Overdue logic based on Schedule/Remaining/Meter Type
+        def _due_frames(df_in: pd.DataFrame):
+            if df_in is None or df_in.empty:
                 return pd.DataFrame(), pd.DataFrame()
-            df = df_can.copy()
-            def row_threshold(r) -> float:
-                mt = str(r.get("__MeterType_norm","")).lower()
-                return 0.05 if ("mile" in mt) else 0.10
-            conds = []
-            condA = (
-                df["__Schedule_num"].notna() &
-                (pd.to_numeric(df["__Schedule_num"], errors="coerce") > 0) &
-                df["__Remaining_num"].notna() &
-                (pd.to_numeric(df["__Remaining_num"], errors="coerce") >= 0)
-            )
-            if condA.any():
-                thrA = df.apply(row_threshold, axis=1)
-                condA2 = pd.to_numeric(df["__Remaining_num"], errors="coerce") <= (pd.to_numeric(df["__Schedule_num"], errors="coerce") * thrA)
-                conds.append(condA & condA2)
-            if "__PctRemain_num" in df.columns:
-                condB = df["__PctRemain_num"].notna()
-                if condB.any():
-                    thrB = df.apply(row_threshold, axis=1)
-                    condB2 = pd.to_numeric(df["__PctRemain_num"], errors="coerce") <= thrB
-                    conds.append(condB & condB2)
-            coming_due_mask = pd.Series(False, index=df.index)
-            for c in conds: coming_due_mask |= c
+            df = df_in.copy()
+
+            # numeric helpers
+            def _num(col):
+                if col not in df.columns: return pd.Series([pd.NA]*len(df))
+                return pd.to_numeric(df[col].astype(str).str.replace("%","", regex=False), errors="coerce")
+
+            sched = _num("Schedule")
+            remaining = _num("Remaining")
+            pct = pd.Series([pd.NA]*len(df))  # not used now, but left for future
+
+            meter_type = df["Meter Type"].astype(str).str.lower() if "Meter Type" in df.columns else pd.Series([""]*len(df))
+            thr = meter_type.map(lambda x: 0.05 if "mile" in x else 0.10)
+
+            coming_due_mask = (sched.notna() & (sched > 0) & remaining.notna() & (remaining >= 0) &
+                               (remaining <= (sched * thr)))
             coming_due = df[coming_due_mask].copy()
 
-            today = pd.Timestamp.today().normalize()
-            overdue_mask = pd.Series(False, index=df.index)
-            if "__Remaining_num" in df.columns:
-                overdue_mask |= (pd.to_numeric(df["__Remaining_num"], errors="coerce") < 0)
-            if "__Due_dt" in df.columns:
-                overdue_mask |= (pd.to_datetime(df["__Due_dt"], errors="coerce") < today)
+            # Overdue if Remaining < 0 (no Due Date column in current headers)
+            overdue_mask = remaining.notna() & (remaining < 0)
             overdue = df[overdue_mask].copy()
+
             return coming_due, overdue
 
-        coming_due_df, overdue_df = _due_frames(canon_in_scope)
+        coming_due_df, overdue_df = _due_frames(raw_show)
+
+        def present_due(df: pd.DataFrame, include_mreading: bool = False):
+            base = ["Location","Name","Last Reading","Date","Last Service Type",
+                    "Date of Last service","Hours/Miles at Last Service","Next Service Type",
+                    "Next Service","Remaining","Meter Type","Schedule"]
+            if include_mreading and "MReading" in df.columns:
+                # we'll insert MReading right after Schedule if present
+                cols = []
+                for c in base:
+                    cols.append(c) if c in df.columns else None
+                    if c == "Schedule" and "MReading" in df.columns:
+                        cols.append("MReading")
+                return df[cols] if cols else df
+            else:
+                cols = [c for c in base if c in df.columns]
+                return df[cols] if cols else df
 
         with t_due:
             st.caption("Coming Due = Remaining ≤ 10% of Schedule (or ≤ 5% if Meter Type contains 'miles').")
             if coming_due_df.empty:
-                st.info("No items are coming due based on the available columns.")
+                st.info("No items are coming due.")
             else:
-                base = ["WO_ID","Title","Service","Asset","Location","Date","User","Status",
-                        "Schedule","Remaining","Percent Remaining","Meter Type","Due Date","Notes","MReading"]
-                show = coming_due_df[[c for c in base if c in coming_due_df.columns]].copy()
-                show = show.sort_values(by=[c for c in ["Due Date","Percent Remaining","Remaining"] if c in show.columns], na_position="last")
-                st.dataframe(_format_dateish_cols(show), use_container_width=True, hide_index=True)
+                show = present_due(coming_due_df, include_mreading=False)
+                st.dataframe(show.sort_values(by=[c for c in ["Next Service","Date","Date of Last service","Remaining"] if c in show.columns], na_position="last"),
+                             use_container_width=True, hide_index=True)
                 c1, c2, _ = st.columns([1,1,6])
                 with c1:
-                    st.download_button("⬇️ Excel (.xlsx)", data=to_xlsx_bytes(_format_dateish_cols(show), sheet="Service_Coming_Due"),
+                    st.download_button("⬇️ Excel (.xlsx)", data=to_xlsx_bytes(show, sheet="Service_Coming_Due"),
                                        file_name="Service_Coming_Due.xlsx",
                                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
                 with c2:
-                    st.download_button("⬇️ Word (.docx)", data=to_docx_bytes(_format_dateish_cols(show), title="Service — Coming Due"),
+                    st.download_button("⬇️ Word (.docx)", data=to_docx_bytes(show, title="Service — Coming Due"),
                                        file_name="Service_Coming_Due.docx",
                                        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
 
         with t_over:
-            st.caption("Overdue = Remaining < 0, or Due Date earlier than today.")
+            st.caption("Overdue = Remaining < 0.")
             if overdue_df.empty:
                 st.info("No overdue items found.")
             else:
-                base = ["WO_ID","Title","Service","Asset","Location","Date","User","Status",
-                        "Schedule","MReading","Remaining","Percent Remaining","Meter Type","Due Date","Notes"]
-                show = overdue_df[[c for c in base if c in overdue_df.columns]].copy()
-                show = show.sort_values(by=[c for c in ["Due Date","Remaining"] if c in show.columns], na_position="last")
-                st.dataframe(_format_dateish_cols(show), use_container_width=True, hide_index=True)
+                # If 'MReading' exists in this sheet, place after Schedule; otherwise, just show the normal set
+                show = present_due(overdue_df, include_mreading=True)
+                st.dataframe(show.sort_values(by=[c for c in ["Next Service","Remaining"] if c in show.columns], na_position="last"),
+                             use_container_width=True, hide_index=True)
                 c1, c2, _ = st.columns([1,1,6])
                 with c1:
-                    st.download_button("⬇️ Excel (.xlsx)", data=to_xlsx_bytes(_format_dateish_cols(show), sheet="Service_Overdue"),
+                    st.download_button("⬇️ Excel (.xlsx)", data=to_xlsx_bytes(show, sheet="Service_Overdue"),
                                        file_name="Service_Overdue.xlsx",
-                                       mime="application/vnd.openxmlformats-officedocument.wordprocessingml.sheet")
+                                       mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
                 with c2:
-                    st.download_button("⬇️ Word (.docx)", data=to_docx_bytes(_format_dateish_cols(show), title="Service — Overdue"),
+                    st.download_button("⬇️ Word (.docx)", data=to_docx_bytes(show, title="Service — Overdue"),
                                        file_name="Service_Overdue.docx",
                                        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
         st.stop()
@@ -777,10 +742,12 @@ else:
             st.warning(f"No Service History data found. Tried: {SHEET_WO_SERVICE_CANDS}. Last error: {msg}")
             st.stop()
 
+        # Restrict to allowed locations via Location2
         if "Location2" in df_hist.columns:
             df_hist["__LocNorm"] = df_hist["Location2"].map(_norm_key)
             df_hist = df_hist[df_hist["__LocNorm"].isin(allowed_norms)].copy()
 
+        # Filters: Location2 + Asset
         c1, c2 = st.columns([2, 3])
         with c1:
             if "Location2" in df_hist.columns:
@@ -789,97 +756,55 @@ else:
                 loc_values = []
             loc_all_label = f"« All my locations ({len(loc_values)}) »" if loc_values else "« All my locations »"
             chosen_loc = st.selectbox("Location", options=[loc_all_label] + loc_values if loc_values else [loc_all_label],
-                                      index=0, label_visibility="collapsed")
+                                      index=0, key="sh_loc", label_visibility="collapsed")
+            st.caption("Location")
 
         if chosen_loc != loc_all_label and "Location2" in df_hist.columns:
-            scope = df_hist[df_hist["Location2"].map(_norm_key) == _norm_key(chosen_loc)].copy()
+            scope = df_hist[_norm_key(df_hist["Location2"]) == _norm_key(chosen_loc)].copy()
         else:
             scope = df_hist.copy()
 
         with c2:
             assets = sorted([a for a in scope.get("Asset", pd.Series([], dtype=str)).dropna().astype(str).str.strip().unique().tolist() if a])
-            sel_asset = st.selectbox("Asset", options=assets, index=0 if assets else None, label_visibility="collapsed")
+            sel_asset = st.selectbox("Asset", options=assets, index=0 if assets else None, key="sh_asset")
 
         if not assets:
-            st.info("No assets available in this Location."); st.stop()
+            st.info("No assets available in this Location.")
+            st.stop()
 
         scope = scope[scope["Asset"] == sel_asset] if "Asset" in scope.columns else scope
 
         if "Date" in scope.columns:
             scope = scope.copy()
             scope["__Date_dt"] = pd.to_datetime(scope["Date"], errors="coerce")
+            scope["Date"] = scope["__Date_dt"].dt.strftime("%Y-%m-%d").where(scope["__Date_dt"].notna(), scope["Date"])
             scope = scope.sort_values(by="__Date_dt", ascending=False, na_position="last").drop(columns="__Date_dt")
 
-        col_order = [c for c in ["Date","WO_ID","Title","Service","MReading","MHours","Asset","User","Location2","Notes","Status"] if c in scope.columns]
-        show_hist = _format_dateish_cols(scope[col_order] if col_order else scope)
+        # Ensure MReading displayed after Service
+        # Build column order dynamically
+        base_cols = []
+        for c in ["Date","WO_ID","Title","Service","MReading","MHours","Asset","Location2"]:
+            if c in scope.columns:
+                base_cols.append(c)
+        show_df = scope[base_cols] if base_cols else scope
 
-        st.caption(f"Sheet used: {used_sheet_or_err} • Rows: {len(show_hist)}")
-        st.dataframe(show_hist, use_container_width=True, hide_index=True)
+        st.caption(f"Sheet used: {used_sheet_or_err} • Rows: {len(scope)}")
+        st.dataframe(show_df, use_container_width=True, hide_index=True)
 
         c1, c2, _ = st.columns([1,1,6])
         with c1:
-            st.download_button("⬇️ Excel (.xlsx)", data=to_xlsx_bytes(show_hist, sheet="Service_History"),
-                               file_name=f"Service_History_{sel_asset.replace(' ','_')}.xlsx" if assets else "Service_History.xlsx",
-                               mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+            st.download_button(
+                "⬇️ Excel (.xlsx)",
+                data=to_xlsx_bytes(show_df, sheet="Service_History"),
+                file_name=f"Service_History_{sel_asset.replace(' ','_')}.xlsx" if assets else "Service_History.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
         with c2:
-            st.download_button("⬇️ Word (.docx)", data=to_docx_bytes(show_hist, title=f"Service History — {sel_asset}" if assets else "Service History"),
-                               file_name=f"Service_History_{sel_asset.replace(' ','_')}.docx" if assets else "Service_History.docx",
-                               mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+            st.download_button(
+                "⬇️ Word (.docx)",
+                data=to_docx_bytes(show_df, title=f"Service History — {sel_asset}" if assets else "Service History"),
+                file_name=f"Service_History_{sel_asset.replace(' ','_')}.docx" if assets else "Service_History.docx",
+                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            )
         st.stop()
-
-    # ========= Procedures Xref (optional) =========
-    if page == "⚙️ Procedures Xref":
-        st.markdown("### Procedures / Filters Cross-Reference")
-
-        proc_df, filt_df = load_procedures_and_filters(xlsx_bytes)
-
-        if proc_df is None and filt_df is None:
-            st.info("No procedures or filters found. Add **service_procedures.xlsx** / **service_filters.xlsx** to the repo, "
-                    "or add sheets **Service_Procedures** / **Service_Procedures_Filters** to Workorders.xlsx.")
-            st.stop()
-
-        # Build pickers
-        services = set()
-        for df in [proc_df, filt_df]:
-            if df is not None and "ServiceKey" in df.columns:
-                services.update(df["ServiceKey"].dropna().astype(str).tolist())
-        services = sorted(services)
-
-        c1, c2 = st.columns([2, 2])
-        with c1:
-            sel_service = st.selectbox("Service", options=["— All —"] + services, index=0, label_visibility="collapsed")
-        with c2:
-            # optional location filter if present in filters file
-            if filt_df is not None:
-                loc_col = next((c for c in filt_df.columns if c.lower() in {"location","location2"}), None)
-            else:
-                loc_col = None
-            loc_opts = sorted(filt_df[loc_col].dropna().unique().tolist()) if (filt_df is not None and loc_col) else []
-            sel_loc = st.selectbox("Location", options=["— Any —"] + loc_opts, index=0, label_visibility="collapsed") if loc_opts else None
-
-        # Filter views
-        view_proc = proc_df.copy() if proc_df is not None else None
-        view_filt = filt_df.copy() if filt_df is not None else None
-
-        if sel_service != "— All —":
-            if view_proc is not None and "ServiceKey" in view_proc.columns:
-                view_proc = view_proc[view_proc["ServiceKey"] == sel_service].copy()
-            if view_filt is not None and "ServiceKey" in view_filt.columns:
-                view_filt = view_filt[view_filt["ServiceKey"] == sel_service].copy()
-        if sel_loc and sel_loc != "— Any —" and view_filt is not None and loc_col:
-            view_filt = view_filt[view_filt[loc_col] == sel_loc].copy()
-
-        # If both have ServiceKey, show a joined view; else show side-by-side
-        if (view_proc is not None and "ServiceKey" in view_proc.columns) and (view_filt is not None and "ServiceKey" in view_filt.columns):
-            joined = view_filt.merge(view_proc, on="ServiceKey", how="left", suffixes=("_Filter","_Proc"))
-            st.dataframe(joined, use_container_width=True, hide_index=True)
-        else:
-            if view_proc is not None:
-                st.subheader("Procedures")
-                st.dataframe(view_proc, use_container_width=True, hide_index=True)
-            if view_filt is not None:
-                st.subheader("Filters")
-                st.dataframe(view_filt, use_container_width=True, hide_index=True)
-        st.stop()
-
 
