@@ -467,7 +467,7 @@ else:
                     mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
                 )
 
-    # =========================
+       # =========================
     # Tab 2: Work Orders (listing)
     # =========================
     with tab_list:
@@ -475,129 +475,139 @@ else:
 
         if df_master is None:
             st.warning(f"Sheet '{SHEET_WO_MASTER}' not found. Add it to the workbook to enable this page.")
-            st.stop()
-
-        # Allowed locations options (from Asset Master)
-        loc_all_label = "« All my locations »"
-        loc_options2 = [loc_all_label] + sorted(allowed_locations)
-        chosen_loc2 = st.selectbox("Location scope", options=loc_options2, index=0)
-
-        # Scope: by Location, by Assigned User, by Team
-        scope = st.radio("Scope", ["By Location", "Assigned User", "Team"], horizontal=True, index=0)
-
-        # Filter df_master by allowed locations first (Location column already computed: Location2 else NS Location)
-        if chosen_loc2 == loc_all_label:
-            df_scope = df_master[df_master["Location"].isin(allowed_locations)].copy()
         else:
-            df_scope = df_master[df_master["Location"] == chosen_loc2].copy()
+            # NOTE: df_master["Location"] already = Location2 (preferred) else NS Location
+            # Exact-match against your allowed locations
+            loc_values_in_master = sorted(set(df_master["Location"].dropna().astype(str)))
+            visible_locs = sorted(set(loc_values_in_master).intersection(set(allowed_locations)))
 
-        # Build pickers for user/team within the chosen location set
-        if scope == "Assigned User":
-            users = sorted([u for u in df_scope.get("Assigned To", pd.Series([], dtype=str)).dropna().astype(str).str.strip().unique().tolist() if u])
-            user_sel = st.selectbox("Assigned To", options=(["— All users —"] + users), index=0)
-            if user_sel != "— All users —":
-                df_scope = df_scope[df_scope["Assigned To"].astype(str).str.strip() == user_sel]
-        elif scope == "Team":
-            # Teams could be comma/semicolon separated; build list
-            raw = df_scope.get("Teams Assigned To", pd.Series([], dtype=str)).fillna("").astype(str)
-            split_vals = set()
-            for v in raw:
-                for p in re.split(r"[;,]", v):
-                    p = p.strip()
-                    if p:
-                        split_vals.add(p)
-            teams = sorted(split_vals)
-            team_sel = st.selectbox("Team", options=(["— All teams —"] + teams), index=0)
-            if team_sel != "— All teams —":
-                df_scope = df_scope[
-                    df_scope["Teams Assigned To"]
-                    .astype(str)
-                    .str.contains(rf"(?:^|[;,]\s*){re.escape(team_sel)}(?:\s*[;,]|$)", na=False)
-                ]
+            loc_all_label = f"« All my locations ({len(visible_locs)}) »"
+            loc_options2 = [loc_all_label] + visible_locs
+            chosen_loc2 = st.selectbox("Location scope", options=loc_options2, index=0)
 
-        # --- Vectorized datetimes for bucketing (fixes .dt error) ---
-        created_dt = pd.to_datetime(df_scope.get("Created On"),  errors="coerce")
-        start_dt   = pd.to_datetime(df_scope.get("Start Date"),  errors="coerce")
-        due_dt     = pd.to_datetime(df_scope.get("Due Date"),    errors="coerce")
-        started_dt = pd.to_datetime(df_scope.get("Started On"),  errors="coerce")
-        done_dt    = pd.to_datetime(df_scope.get("Completed On"),errors="coerce")
-        statusU    = df_scope["__STATUS_UP"] if "__STATUS_UP" in df_scope.columns else pd.Series([""], index=df_scope.index)
+            # Scope: by Location, by Assigned User, by Team
+            scope = st.radio("Scope", ["By Location", "Assigned User", "Team"], horizontal=True, index=0)
 
-        # Use midnight today so comparison is date-based
-        today_ts = pd.Timestamp.today().normalize()
+            # Start with exact location filter
+            if chosen_loc2 == loc_all_label:
+                df_scope = df_master[df_master["Location"].isin(allowed_locations)].copy()
+            else:
+                df_scope = df_master[df_master["Location"] == chosen_loc2].copy()
 
-        # Buckets
-        is_completed   = done_dt.notna() | statusU.isin(DONE_STATUSES)
-        is_overdue     = (~is_completed) & due_dt.notna() & (due_dt < today_ts)
-        # OPEN excludes future Start Date
-        is_open        = (~is_completed) & statusU.isin(OPEN_STATUSES) & (start_dt.isna() | (start_dt <= today_ts))
-        # Not Started = not completed & no Started On and (no Start Date or Start Date in future)
-        is_not_started = (~is_completed) & started_dt.isna() & (start_dt.isna() | (start_dt > today_ts))
+            # --- "Since" filter (Created On on/after selected date) ---
+            since_default = (pd.Timestamp.today().normalize() - pd.Timedelta(days=180)).date()
+            since_date = st.date_input("Show work orders with **Created On** on/after", since_default)
+            created_dt = pd.to_datetime(df_scope.get("Created On"), errors="coerce")
+            if not created_dt.isna().all():
+                df_scope = df_scope[created_dt >= pd.Timestamp(since_date)].copy()
 
-        # Old threshold
-        old_days = st.slider("Old threshold (days since Created On)", min_value=15, max_value=120, value=45, step=5)
-        age_days = (today_ts - created_dt).dt.days
-        is_old   = (~is_completed) & created_dt.notna() & (age_days >= old_days)
-
-        # Tabs within listing
-        t_open, t_overdue, t_not_started, t_old = st.tabs(["Open", "Overdue", "Not Started", f"Old (≥ {old_days}d)"])
-
-        def present(cols: list[str]) -> list[str]:
-            return [c for c in cols if c in df_scope.columns]
-
-        # Column sets
-        cols_open = present(["WORKORDER","TITLE","ASSET","STATUS","Created On","Start Date","Due Date","Assigned To","Teams Assigned To"])
-        cols_overdue = present(["WORKORDER","TITLE","ASSET","STATUS","Due Date","Assigned To","Teams Assigned To"])
-        cols_not_started = present(["WORKORDER","TITLE","ASSET","STATUS","Start Date","Due Date","Assigned To","Teams Assigned To"])
-        cols_old = present(["WORKORDER","TITLE","ASSET","STATUS","Created On","Start Date","Due Date","Assigned To","Teams Assigned To"])
-
-        def show(df_in: pd.DataFrame, label: str, cols: list[str], sort_keys: list[str] | None = None):
-            st.markdown(f"**{label} — rows: {len(df_in)}**")
-            if df_in.empty:
-                st.info("No rows.")
-                return
-            if sort_keys:
-                df_in = df_in.copy()
-                df_in.sort_values(by=[k for k in sort_keys if k in df_in.columns], inplace=True)
-            st.dataframe(df_in[cols] if cols else df_in, use_container_width=True, hide_index=True)
-            c1, c2, _ = st.columns([1,1,3])
-            with c1:
-                st.download_button(
-                    "⬇️ Excel (.xlsx)",
-                    data=to_xlsx_bytes(df_in[cols] if cols else df_in, sheet=label.replace(" ","_")),
-                    file_name=f"WO_{label.replace(' ','_')}.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            # Optional scoping by Assigned User / Team
+            if scope == "Assigned User":
+                users = sorted(
+                    [u for u in df_scope.get("Assigned To", pd.Series([], dtype=str))
+                         .dropna().astype(str).str.strip().unique().tolist() if u]
                 )
-            with c2:
-                st.download_button(
-                    "⬇️ Word (.docx)",
-                    data=to_docx_bytes(df_in[cols] if cols else df_in, title=f"Work Orders — {label}"),
-                    file_name=f"WO_{label.replace(' ','_')}.docx",
-                    mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                )
+                user_sel = st.selectbox("Assigned To", options=(["— All users —"] + users), index=0)
+                if user_sel != "— All users —":
+                    df_scope = df_scope[df_scope["Assigned To"].astype(str).str.strip() == user_sel]
 
-        with t_open:
-            df_open = df_scope[is_open].copy()
-            show(df_open, "Open", cols_open, sort_keys=["Due Date","Start Date","Created On"])
+            elif scope == "Team":
+                raw = df_scope.get("Teams Assigned To", pd.Series([], dtype=str)).fillna("").astype(str)
+                split_vals = set()
+                for v in raw:
+                    for p in re.split(r"[;,]", v):
+                        p = p.strip()
+                        if p:
+                            split_vals.add(p)
+                teams = sorted(split_vals)
+                team_sel = st.selectbox("Team", options=(["— All teams —"] + teams), index=0)
+                if team_sel != "— All teams —":
+                    df_scope = df_scope[
+                        df_scope["Teams Assigned To"]
+                        .astype(str)
+                        .str.contains(rf"(?:^|[;,]\s*){re.escape(team_sel)}(?:\s*[;,]|$)", na=False)
+                    ]
 
-        with t_overdue:
-            df_od = df_scope[is_overdue].copy()
-            show(df_od, "Overdue", cols_overdue, sort_keys=["Due Date"])
+            # --- Vectorized datetimes for bucketing ---
+            created_dt = pd.to_datetime(df_scope.get("Created On"),  errors="coerce")
+            start_dt   = pd.to_datetime(df_scope.get("Start Date"),  errors="coerce")
+            due_dt     = pd.to_datetime(df_scope.get("Due Date"),    errors="coerce")
+            started_dt = pd.to_datetime(df_scope.get("Started On"),  errors="coerce")
+            done_dt    = pd.to_datetime(df_scope.get("Completed On"),errors="coerce")
+            statusU    = df_scope["__STATUS_UP"] if "__STATUS_UP" in df_scope.columns else pd.Series([""], index=df_scope.index)
 
-        with t_not_started:
-            df_ns = df_scope[is_not_started].copy()
-            show(df_ns, "Not Started", cols_not_started, sort_keys=["Start Date","Due Date"])
+            today_ts = pd.Timestamp.today().normalize()
 
-        with t_old:
-            df_old = df_scope[is_old].copy()
-            if not df_old.empty:
-                df_old = df_old.copy()
-                df_old["Age (days)"] = age_days.loc[df_old.index]
-                if "Age (days)" not in cols_old:
-                    cols_old = cols_old + ["Age (days)"]
-            show(df_old, f"Old (≥ {old_days}d)", cols_old, sort_keys=["Created On","Due Date"])
+            # Buckets
+            is_completed   = done_dt.notna() | statusU.isin(DONE_STATUSES)
+            is_overdue     = (~is_completed) & due_dt.notna() & (due_dt < today_ts)
+            # OPEN excludes future Start Date
+            is_open        = (~is_completed) & statusU.isin(OPEN_STATUSES) & (start_dt.isna() | (start_dt <= today_ts))
+            # Not Started = not completed & no Started On AND (no Start Date or Start Date in future)
+            is_not_started = (~is_completed) & started_dt.isna() & (start_dt.isna() | (start_dt > today_ts))
 
+            # Old threshold
+            old_days = st.slider("Old threshold (days since Created On)", min_value=15, max_value=120, value=45, step=5)
+            age_days = (today_ts - created_dt).dt.days
+            is_old   = (~is_completed) & created_dt.notna() & (age_days >= old_days)
 
+            # Tabs within listing
+            t_open, t_overdue, t_not_started, t_old = st.tabs(["Open", "Overdue", "Not Started", f"Old (≥ {old_days}d)"])
+
+            def present(cols: list[str]) -> list[str]:
+                return [c for c in cols if c in df_scope.columns]
+
+            # Column sets
+            cols_open = present(["WORKORDER","TITLE","ASSET","STATUS","Created On","Start Date","Due Date","Assigned To","Teams Assigned To"])
+            cols_overdue = present(["WORKORDER","TITLE","ASSET","STATUS","Due Date","Assigned To","Teams Assigned To"])
+            cols_not_started = present(["WORKORDER","TITLE","ASSET","STATUS","Start Date","Due Date","Assigned To","Teams Assigned To"])
+            cols_old = present(["WORKORDER","TITLE","ASSET","STATUS","Created On","Start Date","Due Date","Assigned To","Teams Assigned To"])
+
+            def show(df_in: pd.DataFrame, label: str, cols: list[str], sort_keys: list[str] | None = None):
+                st.markdown(f"**{label} — rows: {len(df_in)}**")
+                if df_in.empty:
+                    st.info("No rows.")
+                    return
+                if sort_keys:
+                    df_in = df_in.copy()
+                    df_in.sort_values(by=[k for k in sort_keys if k in df_in.columns], inplace=True)
+                st.dataframe(df_in[cols] if cols else df_in, use_container_width=True, hide_index=True)
+                c1, c2, _ = st.columns([1,1,3])
+                with c1:
+                    st.download_button(
+                        "⬇️ Excel (.xlsx)",
+                        data=to_xlsx_bytes(df_in[cols] if cols else df_in, sheet=label.replace(" ","_")),
+                        file_name=f"WO_{label.replace(' ','_')}.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    )
+                with c2:
+                    st.download_button(
+                        "⬇️ Word (.docx)",
+                        data=to_docx_bytes(df_in[cols] if cols else df_in, title=f"Work Orders — {label}"),
+                        file_name=f"WO_{label.replace(' ','_')}.docx",
+                        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                    )
+
+            with t_open:
+                df_open = df_scope[is_open].copy()
+                show(df_open, "Open", cols_open, sort_keys=["Due Date","Start Date","Created On"])
+
+            with t_overdue:
+                df_od = df_scope[is_overdue].copy()
+                show(df_od, "Overdue", cols_overdue, sort_keys=["Due Date"])
+
+            with t_not_started:
+                df_ns = df_scope[is_not_started].copy()
+                show(df_ns, "Not Started", cols_not_started, sort_keys=["Start Date","Due Date"])
+
+            with t_old:
+                df_old = df_scope[is_old].copy()
+                if not df_old.empty:
+                    df_old = df_old.copy()
+                    df_old["Age (days)"] = age_days.loc[df_old.index]
+                    if "Age (days)" not in cols_old:
+                        cols_old = cols_old + ["Age (days)"]
+                show(df_old, f"Old (≥ {old_days}d)", cols_old, sort_keys=["Created On","Due Date"])
 
 
 
