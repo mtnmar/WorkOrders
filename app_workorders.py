@@ -22,7 +22,7 @@ import pandas as pd
 import streamlit as st
 import yaml
 
-APP_VERSION = "2025.10.14c"
+APP_VERSION = "2025.10.14d"
 
 # ---------- deps ----------
 try:
@@ -489,9 +489,7 @@ else:
         else:
             df_scope = df_master[df_master["Location"] == chosen_loc].copy()
 
-        # Build user list:
-        # - If Users sheet exists, use that list.
-        # - Otherwise, derive from df_scope (to avoid leaking names outside this location scope).
+        # Build user list (prefer Users sheet; else derive from in-scope data)
         with c2:
             if opt_users is not None:
                 user_choices = ["— Any user —"] + opt_users
@@ -589,6 +587,125 @@ else:
 
         st.caption(f"In scope: {total_in_scope}  •  After location/user/team filters: {len(df_scope)}  •  Showing ({view}): {len(df_view)}")
         st.dataframe(df_view[use_cols], use_container_width=True, hide_index=True)
+
+        # --- Weekly calendar for Scheduled (Planning) ---
+        if view == "Scheduled (Planning)":
+            st.divider()
+            with st.expander("🗓️ Weekly Calendar (printable)", expanded=False):
+                from datetime import date as _date, timedelta as _timedelta
+                from html import escape as _esc
+
+                # Controls
+                cal_c1, cal_c2 = st.columns([2, 2])
+                with cal_c1:
+                    start_day = st.date_input("Start date", value=_date.today())
+                with cal_c2:
+                    span_choice = st.radio("Span", ["Next 7 workdays", "Next 7 days"], horizontal=True, index=0)
+
+                # Build day list
+                def _next_workdays(start: _date, n: int):
+                    d = start
+                    out = []
+                    while len(out) < n:
+                        if d.weekday() < 5:  # Mon-Fri
+                            out.append(d)
+                        d += _timedelta(days=1)
+                    return out
+
+                if span_choice == "Next 7 workdays":
+                    days = _next_workdays(start_day, 7)
+                else:
+                    days = [start_day + _timedelta(days=i) for i in range(7)]
+
+                # Use current scheduled view rows (df_view) and group them by Planned Start Date
+                if "Planned Start Date" in df_view.columns:
+                    _psd = pd.to_datetime(df_view["Planned Start Date"], errors="coerce").dt.date
+                    cal_df = df_view.copy()
+                    cal_df["_PS_DATE"] = _psd
+                else:
+                    cal_df = df_view.assign(_PS_DATE=pd.NaT)
+
+                # Helper to format each WO line
+                def _fmt_row(r):
+                    rid   = _esc(str(r.get("ID", "") or ""))
+                    title = _esc(str(r.get("Title", "") or ""))
+                    asset = _esc(str(r.get("Asset", "") or ""))
+                    asgn  = _esc(str(r.get("Assigned to", "") or ""))
+                    due   = _esc(str(r.get("Due date", "") or ""))
+                    bits = []
+                    if rid or title:
+                        bits.append(f"<div class='id'>{rid}</div><div class='title'>{title}</div>")
+                    if asset:
+                        bits.append(f"<div class='meta'>Asset: {asset}</div>")
+                    if asgn:
+                        bits.append(f"<div class='meta'>Assigned: {asgn}</div>")
+                    if due:
+                        bits.append(f"<div class='meta'>Due: {due}</div>")
+                    return "<div class='item'>" + "".join(bits) + "</div>"
+
+                # Header label for calendar
+                hdr_loc = chosen_loc if chosen_loc != loc_all_label else "All Locations"
+                cal_title = f"Scheduled Work Orders — {hdr_loc}"
+
+                # Build HTML
+                html_parts = []
+                html_parts.append("""
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Scheduled Work Orders</title>
+<style>
+  * { box-sizing: border-box; }
+  body { font-family: Calibri, Arial, sans-serif; margin: 16px; }
+  h2 { margin: 0 0 12px 0; }
+  .print-btn { margin: 8px 0 16px 0; }
+  table { border-collapse: collapse; width: 100%; table-layout: fixed; }
+  th, td { border: 1px solid #ccc; vertical-align: top; padding: 8px; font-size: 12px; }
+  th { background: #f5f5f5; text-align: left; }
+  .day { min-height: 220px; }
+  .item { padding: 6px; margin: 6px 0; border-left: 3px solid #aaa; background: #fafafa; }
+  .id { font-weight: 700; }
+  .title { font-weight: 600; margin-bottom: 2px; }
+  .meta { color: #555; font-size: 11px; }
+  @media print {
+    .print-btn { display: none; }
+    body { margin: 0; }
+  }
+</style>
+</head>
+<body>
+""")
+                html_parts.append(f"<h2>{_esc(cal_title)}</h2>")
+                html_parts.append("<button class='print-btn' onclick='window.print()'>🖨️ Print</button>")
+
+                # Header row
+                html_parts.append("<table><thead><tr>")
+                for d in days:
+                    html_parts.append(f"<th>{d.strftime('%a %m/%d')}</th>")
+                html_parts.append("</tr></thead><tbody><tr>")
+
+                # Cells
+                for d in days:
+                    day_rows = cal_df.loc[cal_df["_PS_DATE"] == d].copy()
+                    html_parts.append("<td class='day'>")
+                    if day_rows.empty:
+                        html_parts.append("<div class='meta'>— No scheduled work —</div>")
+                    else:
+                        for _, rr in day_rows.iterrows():
+                            html_parts.append(_fmt_row(rr))
+                    html_parts.append("</td>")
+                html_parts.append("</tr></tbody></table></body></html>")
+                html_calendar = "".join(html_parts)
+
+                # Show inline and offer download
+                st.markdown(html_calendar, unsafe_allow_html=True)
+                st.download_button(
+                    "⬇️ Printable HTML (weekly calendar)",
+                    data=html_calendar.encode("utf-8"),
+                    file_name="Scheduled_Calendar.html",
+                    mime="text/html",
+                )
 
         # Downloads
         c1, c2, _ = st.columns([1, 1, 6])
