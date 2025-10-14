@@ -4,7 +4,7 @@
 # - Login via streamlit-authenticator
 # - Access control by Location (user -> allowed locations)
 # - Page 1: 🔎 Asset History (existing behavior)
-# - Page 2: 📋 Work Orders (Location/User/Team -> Open/Overdue/Not Started/Old)
+# - Page 2: 📋 Work Orders (Location/User/Team -> Open/Overdue/Scheduled/Completed/Old)
 # - Uses Workorders sheet for history and Workorders_Master for listing
 # - Dates normalized to YYYY-MM-DD
 # - Robust GitHub download + "Data last updated" from latest commit
@@ -21,7 +21,7 @@ import pandas as pd
 import streamlit as st
 import yaml
 
-APP_VERSION = "2025.10.13b"
+APP_VERSION = "2025.10.13c"
 
 # ---------- deps ----------
 try:
@@ -69,10 +69,6 @@ MASTER_CANON = {
     "Location2": {"location2", "location 2", "loc2"},
     "NS Location": {"ns location", "netsuite location", "ns_location"},
 }
-
-# Status buckets
-OPEN_STATUSES = {"OPEN", "ON HOLD", "ON-HOLD", "IN PROCESS", "IN-PROCESS", "INPROCESS", "PENDING"}
-DONE_STATUSES = {"COMPLETE", "COMPLETED", "CLOSED", "DONE", "RESOLVED"}
 
 # ---------- helpers ----------
 def to_plain(obj):
@@ -308,12 +304,6 @@ def load_wo_master_df(xlsx_bytes: bytes, sheet: str) -> pd.DataFrame:
         if dc in df.columns:
             df[dc] = df[dc].map(_norm_date_any)
 
-    # Status upper for bucketing
-    if "STATUS" in df.columns:
-        df["__STATUS_UP"] = df["STATUS"].map(lambda s: re.sub(r"\s+", " ", str(s).strip().upper()))
-    else:
-        df["__STATUS_UP"] = ""
-
     # tidy strings
     for c in [x for x in ["WORKORDER","TITLE","DESCRIPTION","ASSET","Assigned To","Teams Assigned To","Completed By","Location"] if x in df.columns]:
         df[c] = df[c].astype(str).str.strip()
@@ -326,7 +316,7 @@ st.sidebar.caption(f"SPF Work Orders — v{APP_VERSION}")
 cfg = load_config()
 cfg = to_plain(cfg)
 
-# Auth
+# ---- Auth (no lingering form) ----
 cookie_cfg = cfg.get("cookie", {})
 auth = stauth.Authenticate(
     cfg.get("credentials", {}),
@@ -335,13 +325,18 @@ auth = stauth.Authenticate(
     cookie_cfg.get("expiry_days", 7),
 )
 
-name, auth_status, username = auth.login("Login", "main")
+_login_ph = st.empty()
+with _login_ph.container():
+    name, auth_status, username = auth.login("Login", "main")
 
 if auth_status is False:
     st.error("Username/password is incorrect")
+    st.stop()
 elif auth_status is None:
     st.info("Please log in.")
+    st.stop()
 else:
+    _login_ph.empty()
     auth.logout("Logout", "sidebar")
     st.sidebar.success(f"Logged in as {name}")
 
@@ -467,8 +462,8 @@ else:
                     mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
                 )
 
-       # =========================
-    # Tab 2: Work Orders (listing) — date-driven buckets, no STATUS
+    # =========================
+    # Tab 2: Work Orders (listing) — date-driven buckets, STATUS ignored
     # =========================
     with tab_list:
         st.markdown("### Work Orders — Filtered Views (date-driven)")
@@ -488,10 +483,8 @@ else:
                 df_scope = df_master[df_master["Location"].isin(allowed_locations)].copy()
             else:
                 df_scope = df_master[df_master["Location"] == chosen_loc2].copy()
-            st.caption(f"Rows after location filter: {len(df_scope)}")
 
-            # ---------- Optional: pull allowed users/teams from an 'WO_Assignees' sheet ----------
-            # Expected columns (case-insensitive): Location, Assigned To, Team
+            # ---------- Optional: allowed users/teams from 'WO_Assignees' sheet ----------
             assignees_users, assignees_teams = None, None
             try:
                 df_assign = pd.read_excel(
@@ -501,14 +494,12 @@ else:
                     keep_default_na=False,
                     engine="openpyxl",
                 )
-                # Canonicalize a bit
                 df_assign.columns = [str(c).strip() for c in df_assign.columns]
                 cols_low = {c.lower(): c for c in df_assign.columns}
                 col_loc  = cols_low.get("location")
                 col_user = cols_low.get("assigned to") or cols_low.get("user") or cols_low.get("username")
                 col_team = cols_low.get("team") or cols_low.get("teams")
                 if col_loc and (col_user or col_team):
-                    # Limit to current location scope (or all visible locations)
                     if chosen_loc2 == loc_all_label:
                         df_a = df_assign[df_assign[col_loc].astype(str).isin(visible_locs)]
                     else:
@@ -522,26 +513,23 @@ else:
                             t for t in df_a[col_team].dropna().astype(str).str.strip().unique().tolist() if t
                         )
             except Exception:
-                pass  # silently ignore if sheet missing or malformed
+                pass
 
-            # ---------- User / Team filters (fallback to in-scope values if WO_Assignees not present) ----------
+            # ---------- User / Team filters (fallbacks if WO_Assignees missing) ----------
             fallback_users = sorted(
-                u for u in df_scope.get("Assigned To", pd.Series([], dtype=str))
+                u for u in (df_scope["Assigned To"] if "Assigned To" in df_scope.columns else pd.Series([], dtype=str))
                     .dropna().astype(str).str.strip().unique().tolist() if u
             )
             users = assignees_users if assignees_users is not None else fallback_users
             sel_users = st.multiselect("Filter: Assigned User(s)", options=users, default=[])
-            if sel_users:
+            if sel_users and "Assigned To" in df_scope.columns:
                 df_scope = df_scope[df_scope["Assigned To"].astype(str).str.strip().isin(sel_users)].copy()
-            st.caption(f"Rows after user filter: {len(df_scope)}")
 
-            # Teams can be tokenized (comma/semicolon) if we don't have WO_Assignees
+            # Teams (tokenize comma/semicolon if needed)
             if assignees_teams is not None:
                 teams = assignees_teams
-                def team_hit_strict(s: str) -> bool:
-                    return s.strip() in sel_teams_norm if s else False
             else:
-                raw_teams = df_scope.get("Teams Assigned To", pd.Series([], dtype=str)).fillna("").astype(str)
+                raw_teams = (df_scope["Teams Assigned To"] if "Teams Assigned To" in df_scope.columns else pd.Series([], dtype=str)).fillna("").astype(str)
                 token_set = set()
                 for v in raw_teams:
                     for t in re.split(r"[;,]", v):
@@ -551,56 +539,42 @@ else:
                 teams = sorted(token_set)
 
             sel_teams = st.multiselect("Filter: Team(s)", options=teams, default=[])
-            if sel_teams:
+            if sel_teams and "Teams Assigned To" in df_scope.columns:
                 sel_teams_norm = {t.strip() for t in sel_teams}
                 def team_hit(s: str) -> bool:
                     if not s: return False
                     parts = {p.strip() for p in re.split(r"[;,]", str(s)) if p.strip()}
                     return bool(parts & sel_teams_norm)
                 df_scope = df_scope[df_scope["Teams Assigned To"].fillna("").astype(str).map(team_hit)].copy()
-            st.caption(f"Rows after team filter: {len(df_scope)}")
 
             # ---------- Dates (vectorized) ----------
             def s(col: str):
                 return df_scope[col] if col in df_scope.columns else pd.Series(pd.NA, index=df_scope.index)
 
-            created_dt  = pd.to_datetime(s("Created On"),   errors="coerce")
-            start_dt    = pd.to_datetime(s("Start Date"),   errors="coerce")
-            due_dt      = pd.to_datetime(s("Due Date"),     errors="coerce")
-            started_dt  = pd.to_datetime(s("Started On"),   errors="coerce")
-            completed_dt= pd.to_datetime(s("Completed On"), errors="coerce")
+            created_dt   = pd.to_datetime(s("Created On"),   errors="coerce")
+            start_dt     = pd.to_datetime(s("Start Date"),   errors="coerce")
+            due_dt       = pd.to_datetime(s("Due Date"),     errors="coerce")
+            completed_dt = pd.to_datetime(s("Completed On"), errors="coerce")
 
             today = pd.Timestamp.today().normalize()
 
             # ---------- Buckets (STATUS ignored) ----------
-            is_completed   = completed_dt.notna()
-            is_overdue     = (~is_completed) & due_dt.notna() & (due_dt < today)
-            is_scheduled   = (~is_completed) & start_dt.notna() & (start_dt > today)
-            # Active today (neither overdue nor scheduled future)
-            is_active      = (~is_completed) & ( (start_dt.isna() | (start_dt <= today)) & (due_dt.isna() | (due_dt >= today)) )
-            # Old can overlap others; just a flag
-            is_old         = (~is_completed) & created_dt.notna() & (created_dt < today)
-
-            # ---------- Bucket counters ----------
-            st.caption(
-                f"Buckets — All: {len(df_scope)} | "
-                f"Active: {int(is_active.sum())} | "
-                f"Overdue: {int(is_overdue.sum())} | "
-                f"Scheduled: {int(is_scheduled.sum())} | "
-                f"Completed: {int(is_completed.sum())} | "
-                f"Old (flag): {int(is_old.sum())}"
-            )
+            is_completed = completed_dt.notna()
+            is_overdue   = (~is_completed) & due_dt.notna()   & (due_dt < today)
+            is_sched     = (~is_completed) & start_dt.notna() & (start_dt > today)
+            is_open      = (~is_completed) & (~is_overdue) & (~is_sched)
+            is_old_flag  = (~is_completed) & created_dt.notna() & (created_dt < today)
 
             # ---------- Column sets per view ----------
             def present(cols: list[str]) -> list[str]:
                 return [c for c in cols if c in df_scope.columns]
 
-            cols_all        = present(["WORKORDER","TITLE","ASSET","Created On","Start Date","Due Date","Completed On","Assigned To","Teams Assigned To","Location"])
-            cols_active     = present(["WORKORDER","TITLE","ASSET","Created On","Due Date","Assigned To","Teams Assigned To","Location"])
-            cols_overdue    = present(["WORKORDER","TITLE","ASSET","Due Date","Assigned To","Teams Assigned To","Location"])
-            cols_scheduled  = present(["WORKORDER","TITLE","ASSET","Start Date","Due Date","Assigned To","Teams Assigned To","Location"])
-            cols_completed  = present(["WORKORDER","TITLE","ASSET","Completed On","Assigned To","Teams Assigned To","Location"])
-            cols_old        = present(["WORKORDER","TITLE","ASSET","Created On","Due Date","Completed On","Assigned To","Teams Assigned To","Location"])
+            cols_all     = present(["WORKORDER","TITLE","ASSET","Created On","Start Date","Due Date","Completed On","Assigned To","Teams Assigned To","Location"])
+            cols_open    = present(["WORKORDER","TITLE","ASSET","Created On","Due Date","Assigned To","Teams Assigned To","Location"])
+            cols_overdue = present(["WORKORDER","TITLE","ASSET","Due Date","Assigned To","Teams Assigned To","Location"])
+            cols_sched   = present(["WORKORDER","TITLE","ASSET","Start Date","Due Date","Assigned To","Teams Assigned To","Location"])
+            cols_done    = present(["WORKORDER","TITLE","ASSET","Completed On","Assigned To","Teams Assigned To","Location"])
+            cols_old     = present(["WORKORDER","TITLE","ASSET","Created On","Due Date","Completed On","Assigned To","Teams Assigned To","Location"])
 
             # ---------- Presenter ----------
             def show(df_in: pd.DataFrame, label: str, cols: list[str], sort_keys: list[str] | None = None):
@@ -629,25 +603,25 @@ else:
                     )
 
             # ---------- Tabs ----------
-            t_all, t_active, t_overdue, t_sched, t_done, t_old = st.tabs(
-                ["All (in scope)", "Active (Today)", "Overdue", "Scheduled (Planning)", "Completed", "Old (flag)"]
+            t_all, t_open, t_overdue, t_sched, t_done, t_old = st.tabs(
+                ["All (in scope)", "Open (Today)", "Overdue", "Scheduled (Planning)", "Completed", "Old (flag)"]
             )
 
             with t_all:
                 show(df_scope.copy(), "All (in scope)", cols_all, sort_keys=["Completed On","Due Date","Start Date","Created On"])
 
-            with t_active:
-                show(df_scope[is_active].copy(), "Active (Today)", cols_active, sort_keys=["Due Date","Created On"])
+            with t_open:
+                show(df_scope[is_open].copy(), "Open (Today)", cols_open, sort_keys=["Due Date","Created On"])
 
             with t_overdue:
                 show(df_scope[is_overdue].copy(), "Overdue", cols_overdue, sort_keys=["Due Date"])
 
             with t_sched:
-                show(df_scope[is_scheduled].copy(), "Scheduled (Planning)", cols_scheduled, sort_keys=["Start Date","Due Date"])
+                show(df_scope[is_sched].copy(), "Scheduled (Planning)", cols_sched, sort_keys=["Start Date","Due Date"])
 
             with t_done:
-                show(df_scope[is_completed].copy(), "Completed", cols_completed, sort_keys=["Completed On"])
+                show(df_scope[is_completed].copy(), "Completed", cols_done, sort_keys=["Completed On"])
 
             with t_old:
-                # Old is a flag; show those rows regardless of other buckets
-                show(df_scope[is_old].copy(), "Old (flag)", cols_old, sort_keys=["Created On","Due Date"])
+                show(df_scope[is_old_flag].copy(), "Old (flag)", cols_old, sort_keys=["Created On","Due Date"])
+
