@@ -3,15 +3,17 @@
 # SPF Work Orders (reads Excel from GitHub private repo)
 # - Login via streamlit-authenticator
 # - Access control by Location (user -> allowed locations)
-# - Page 1: 🔎 Asset History (existing behavior)
-# - Page 2: 📋 Work Orders (Location/User/Team -> Open/Overdue/Scheduled/Completed/Old)
-# - Uses Workorders sheet for history and Workorders_Master for listing
-# - Dates normalized to YYYY-MM-DD
+# - Sidebar: choose page (History vs Work Orders)
+# - Top-of-page filters for Work Orders (Location, User, Team, View)
+# - Workorders_Master already includes: Location, IsOpen, IsOverdue, IsScheduled, IsCompleted, IsOld
+# - Never reveal assignments outside allowed locations; if a selected user has
+#   no WOs at the chosen location, show "User not found at this location."
+# - Dates normalized to YYYY-MM-DD where needed
 # - Robust GitHub download + "Data last updated" from latest commit
 # --------------------------------------------------------------
 
 from __future__ import annotations
-import io, textwrap, re
+import io, re
 from pathlib import Path
 from collections.abc import Mapping
 from datetime import datetime, timezone
@@ -21,7 +23,7 @@ import pandas as pd
 import streamlit as st
 import yaml
 
-APP_VERSION = "2025.10.13c"
+APP_VERSION = "2025.10.14"
 
 # ---------- deps ----------
 try:
@@ -40,9 +42,10 @@ except Exception:
 st.set_page_config(page_title="SPF Work Orders", page_icon="🧰", layout="wide")
 
 # ---------- constants ----------
-SHEET_WORKORDERS     = "Workorders"         # history sheet
+SHEET_WORKORDERS     = "Workorders"         # history sheet (unchanged)
 SHEET_ASSET_MASTER   = "Asset_Master"
-SHEET_WO_MASTER      = "Workorders_Master"  # new listing sheet
+SHEET_WO_MASTER      = "Workorders_Master"  # new listing sheet with flags
+SHEET_USERS_CANDIDATES = ["Users", "Users]", "USERS", "users"]  # accept minor naming variations
 
 REQUIRED_WO_COLS = [
     "WORKORDER", "TITLE", "STATUS", "PO", "P/N", "QUANTITY RECEIVED",
@@ -51,24 +54,12 @@ REQUIRED_WO_COLS = [
 OPTIONAL_SORT_COL = "Sort"       # if present, 1=WO, 2=PO, 3=TRANS
 ASSET_MASTER_COLS = ["Location", "ASSET"]
 
-# Canonical mapping for Workorders_Master
-MASTER_CANON = {
-    "WORKORDER": {"id", "workorder", "wo", "wo #", "work order", "work order #", "wo#"},
-    "TITLE": {"title"},
-    "DESCRIPTION": {"description"},
-    "ASSET": {"asset"},
-    "STATUS": {"status"},
-    "Created On": {"created on", "created", "created date"},
-    "Start Date": {"planned start date", "start date", "planned start", "start"},
-    "Due Date": {"due date", "due"},
-    "Started On": {"started on"},
-    "Completed On": {"completed on", "completed"},
-    "Assigned To": {"assigned to"},
-    "Teams Assigned To": {"teams assigned to"},
-    "Completed By": {"completed by"},
-    "Location2": {"location2", "location 2", "loc2"},
-    "NS Location": {"ns location", "netsuite location", "ns_location"},
-}
+# The canonical columns we expect in Workorders_Master now:
+MASTER_REQUIRED = [
+    "ID","Title","Description","Asset","Status","Created on","Planned Start Date",
+    "Due date","Started on","Completed on","Assigned to","Teams Assigned to",
+    "Completed by","Location","IsOpen","IsOverdue","IsScheduled","IsCompleted","IsOld"
+]
 
 # ---------- helpers ----------
 def to_plain(obj):
@@ -146,36 +137,6 @@ def get_xlsx_bytes(cfg: dict) -> bytes:
         token=gh.get("token"),
     )
 
-def _norm_date_any(s: str) -> str:
-    s = (str(s) if s is not None else "").strip()
-    if not s:
-        return ""
-    for fmt in ("%Y-%m-%d", "%m/%d/%Y", "%m/%d/%y", "%d-%b-%Y", "%Y-%m-%d %H:%M:%S"):
-        try:
-            return datetime.strptime(s, fmt).strftime("%Y-%m-%d")
-        except Exception:
-            pass
-    try:
-        dt = pd.to_datetime(s, errors="coerce")
-        return "" if pd.isna(dt) else dt.strftime("%Y-%m-%d")
-    except Exception:
-        return s
-
-def _canonize_headers(cols: list[str], canon: dict[str,set[str]]) -> dict[str, str]:
-    low = {str(c).strip().lower(): str(c) for c in cols}
-    mapping: dict[str, str] = {}
-    for key, aliases in canon.items():
-        key_low = key.strip().lower()
-        if key_low in low:
-            mapping[low[key_low]] = key
-            continue
-        for k_low, orig in low.items():
-            k_clean = re.sub(r"\s+", " ", k_low)
-            if k_clean in aliases or k_low in aliases:
-                mapping[orig] = key
-                break
-    return mapping
-
 def get_data_last_updated() -> str | None:
     gh = st.secrets.get("github") if hasattr(st, "secrets") else None
     if not gh or not gh.get("repo") or not gh.get("path"):
@@ -194,6 +155,21 @@ def get_data_last_updated() -> str | None:
         return dt.strftime("Data last updated: %Y-%m-%d %H:%M UTC")
     except Exception:
         return None
+
+def _norm_date_any(s: str) -> str:
+    s = (str(s) if s is not None else "").strip()
+    if not s:
+        return ""
+    for fmt in ("%Y-%m-%d", "%m/%d/%Y", "%m/%d/%y", "%d-%b-%Y", "%Y-%m-%d %H:%M:%S"):
+        try:
+            return datetime.strptime(s, fmt).strftime("%Y-%m-%d")
+        except Exception:
+            pass
+    try:
+        dt = pd.to_datetime(s, errors="coerce")
+        return "" if pd.isna(dt) else dt.strftime("%Y-%m-%d")
+    except Exception:
+        return s
 
 def to_xlsx_bytes(df: pd.DataFrame, sheet: str) -> bytes:
     import xlsxwriter
@@ -230,6 +206,16 @@ def to_docx_bytes(df: pd.DataFrame, title: str) -> bytes:
     out = io.BytesIO()
     doc.save(out)
     return out.getvalue()
+
+def coerce_bool(s: pd.Series) -> pd.Series:
+    """Coerce common truthy/falsey strings to booleans; keep NaN -> False by default."""
+    if s.dtype == bool:
+        return s
+    m = s.astype(str).str.strip().str.lower()
+    true_vals  = {"true","yes","y","1","t"}
+    false_vals = {"false","no","n","0","f","", "nan", "none"}
+    out = m.map(lambda x: True if x in true_vals else (False if x in false_vals else False))
+    return out.astype(bool)
 
 # ---------- data loaders ----------
 @st.cache_data(show_spinner=False)
@@ -277,38 +263,63 @@ def load_asset_master_df(xlsx_bytes: bytes, sheet: str) -> pd.DataFrame:
 
 @st.cache_data(show_spinner=False)
 def load_wo_master_df(xlsx_bytes: bytes, sheet: str) -> pd.DataFrame:
-    """Listing sheet for Work Orders (non-history)."""
+    """Listing sheet for Work Orders (non-history) with flags already calculated."""
     df = pd.read_excel(
         io.BytesIO(xlsx_bytes),
         sheet_name=sheet,
-        dtype=str,
+        dtype=str,                # read as text, then normalize
         keep_default_na=False,
         engine="openpyxl",
     )
-    # Canonicalize headers
     df.columns = [str(c).strip() for c in df.columns]
-    col_map = _canonize_headers(df.columns.tolist(), MASTER_CANON)
-    df = df.rename(columns=col_map)
+    # Keep only the expected columns if present; otherwise keep what's there
+    have = [c for c in MASTER_REQUIRED if c in df.columns]
+    if have:
+        df = df[have].copy()
 
-    # Effective Location: prefer Location2, else NS Location
-    loc2 = df.get("Location2", "")
-    nsl  = df.get("NS Location", "")
-    df["Location"] = (
-        pd.Series(loc2, dtype="object").astype(str).str.strip()
-        .where(pd.Series(loc2, dtype="object").astype(str).str.strip().ne(""),
-               pd.Series(nsl, dtype="object").astype(str).str.strip())
-    )
-
-    # Normalize dates (as display strings)
-    for dc in ("Created On","Start Date","Due Date","Started On","Completed On"):
+    # Normalize dates to YYYY-MM-DD strings
+    for dc in ("Created on","Planned Start Date","Due date","Started on","Completed on"):
         if dc in df.columns:
             df[dc] = df[dc].map(_norm_date_any)
 
-    # tidy strings
-    for c in [x for x in ["WORKORDER","TITLE","DESCRIPTION","ASSET","Assigned To","Teams Assigned To","Completed By","Location"] if x in df.columns]:
+    # Coerce flags to booleans
+    for bc in ("IsOpen","IsOverdue","IsScheduled","IsCompleted","IsOld"):
+        if bc in df.columns:
+            df[bc] = coerce_bool(df[bc])
+
+    # Tidy strings
+    for c in [x for x in ["ID","Title","Description","Asset","Status","Assigned to","Teams Assigned to","Completed by","Location"] if x in df.columns]:
         df[c] = df[c].astype(str).str.strip()
 
+    # ID often numeric: keep as string for stable display
+    if "ID" in df.columns:
+        df["ID"] = df["ID"].astype(str).str.strip()
+
     return df
+
+@st.cache_data(show_spinner=False)
+def load_users_sheet(xlsx_bytes: bytes) -> list[str] | None:
+    """Optional Users sheet providing the full picklist of users (names)."""
+    for name in SHEET_USERS_CANDIDATES:
+        try:
+            dfu = pd.read_excel(
+                io.BytesIO(xlsx_bytes),
+                sheet_name=name,
+                dtype=str,
+                keep_default_na=False,
+                engine="openpyxl",
+            )
+            # Expect a column named 'User' (case-insensitive)
+            cols_low = {c.lower(): c for c in dfu.columns}
+            col = cols_low.get("user")
+            if not col:
+                continue
+            users = [u.strip() for u in dfu[col].astype(str).tolist() if str(u).strip()]
+            users = sorted(dict.fromkeys(users))  # unique preserve order-ish
+            return users
+        except Exception:
+            pass
+    return None
 
 # ---------- App ----------
 st.sidebar.caption(f"SPF Work Orders — v{APP_VERSION}")
@@ -316,7 +327,7 @@ st.sidebar.caption(f"SPF Work Orders — v{APP_VERSION}")
 cfg = load_config()
 cfg = to_plain(cfg)
 
-# ---- Auth (no lingering form) ----
+# Auth
 cookie_cfg = cfg.get("cookie", {})
 auth = stauth.Authenticate(
     cfg.get("credentials", {}),
@@ -325,18 +336,13 @@ auth = stauth.Authenticate(
     cookie_cfg.get("expiry_days", 7),
 )
 
-_login_ph = st.empty()
-with _login_ph.container():
-    name, auth_status, username = auth.login("Login", "main")
+name, auth_status, username = auth.login("Login", "main")
 
 if auth_status is False:
     st.error("Username/password is incorrect")
-    st.stop()
 elif auth_status is None:
     st.info("Please log in.")
-    st.stop()
 else:
-    _login_ph.empty()
     auth.logout("Logout", "sidebar")
     st.sidebar.success(f"Logged in as {name}")
 
@@ -348,29 +354,26 @@ else:
         st.cache_data.clear()
         st.rerun()
 
+    # Page choice in SIDEBAR (to leave more width for the table)
+    page = st.sidebar.radio("Page", ["🔎 Asset History", "📋 Work Orders"], index=1)
+
+    # Load workbook
     try:
         xlsx_bytes = get_xlsx_bytes(cfg)
     except Exception as e:
         st.error(f"Could not load Excel: {e}")
         st.stop()
 
+    # Access control: Locations
     try:
-        df_all = load_workorders_df(xlsx_bytes, SHEET_WORKORDERS)
         df_am  = load_asset_master_df(xlsx_bytes, SHEET_ASSET_MASTER)
     except BadZipFile:
         st.error("The downloaded file isn’t a valid .xlsx. Check your [github] repo/path/branch/token.")
         st.stop()
     except Exception as e:
-        st.error(f"Failed to read Excel (history): {e}")
+        st.error(f"Failed to read Asset_Master: {e}")
         st.stop()
 
-    # Load Workorders_Master (listing) if present
-    try:
-        df_master = load_wo_master_df(xlsx_bytes, SHEET_WO_MASTER)
-    except Exception:
-        df_master = None  # we'll warn inside the tab
-
-    # ---- Access control by Location ----
     username_ci = str(username).casefold()
     admins_ci = {str(u).casefold() for u in (cfg.get("access", {}).get("admin_usernames", []) or [])}
     is_admin = username_ci in admins_ci
@@ -385,243 +388,225 @@ else:
 
     all_locations = sorted(df_am["Location"].dropna().unique().tolist())
     allowed_locations = set(all_locations) if (is_admin or star) else {loc for loc in all_locations if loc in set(allowed_cfg)}
-
     if not allowed_locations:
         st.error("No Locations configured for your account. Ask an admin to update your access.")
         with st.expander("Locations present in Asset_Master"):
             st.write(all_locations)
         st.stop()
 
-    # --- Tabs (pages) ---
-    tab_hist, tab_list = st.tabs(["🔎 Asset History", "📋 Work Orders"])
-
-    # =========================
-    # Tab 1: Asset History
-    # =========================
-    with tab_hist:
-        # Sidebar selectors for history
-        loc_placeholder = "— Choose Location —"
-        loc_options = [loc_placeholder] + sorted(allowed_locations)
-        chosen_loc = st.sidebar.selectbox("Location", options=loc_options, index=0)
-
-        assets_for_loc = sorted(df_am.loc[df_am["Location"] == chosen_loc, "ASSET"].dropna().unique().tolist()) if chosen_loc != loc_placeholder else []
-        asset_placeholder = "— Choose Asset —"
-        asset_options = [asset_placeholder] + assets_for_loc
-        chosen_asset = st.sidebar.selectbox("Asset", options=asset_options, index=0)
-
+    # ========= Page: Asset History =========
+    if page == "🔎 Asset History":
         st.markdown("### Asset History")
-        if chosen_loc == loc_placeholder:
-            st.info("Select a Location to load Assets.")
-        elif chosen_asset == asset_placeholder:
-            st.info("Select an Asset to view its history.")
+        # Filters across the top (Location then Asset)
+        c1, c2 = st.columns([2, 3])
+        with c1:
+            loc_options = sorted(allowed_locations)
+            chosen_loc = st.selectbox("Location", options=loc_options, index=0)
+        with c2:
+            assets_for_loc = sorted(df_am.loc[df_am["Location"] == chosen_loc, "ASSET"].dropna().unique().tolist())
+            chosen_asset = st.selectbox("Asset", options=assets_for_loc, index=0 if assets_for_loc else None)
+
+        if not assets_for_loc:
+            st.info("No assets for this Location.")
+            st.stop()
+
+        # Load history only if needed
+        try:
+            df_all = load_workorders_df(xlsx_bytes, SHEET_WORKORDERS)
+        except Exception as e:
+            st.error(f"Failed to read Workorders (history): {e}")
+            st.stop()
+
+        df = df_all[(df_all["Location"] == chosen_loc) & (df_all["ASSET"] == chosen_asset)].copy()
+
+        # Drop negative/zero part transactions (keeps nulls/non-part rows)
+        if "QUANTITY RECEIVED" in df.columns and "P/N" in df.columns:
+            qnum = pd.to_numeric(df["QUANTITY RECEIVED"], errors="coerce")
+            is_part = df["P/N"].astype(str).str.strip().ne("")
+            df = df[~(is_part & qnum.notna() & (qnum <= 0))].copy()
+
+        # Order: WORKORDER ASC, then Sort ASC (1=WO,2=PO,3=TRANS), then stable by original row
+        df["__row"] = range(len(df))
+        if OPTIONAL_SORT_COL in df.columns:
+            df["__sort_key"] = pd.to_numeric(df[OPTIONAL_SORT_COL], errors="coerce").fillna(1).astype(int)
         else:
-            df = df_all[(df_all["Location"] == chosen_loc) & (df_all["ASSET"] == chosen_asset)].copy()
+            df["__sort_key"] = 1
+        df.sort_values(by=["WORKORDER", "__sort_key", "__row"], ascending=[True, True, True], inplace=True)
+        df.loc[df["__sort_key"].isin([2, 3]), "WORKORDER"] = ""
 
-            # Optional: drop negative/zero part transactions (keeps nulls/non-part rows)
-            if "QUANTITY RECEIVED" in df.columns and "P/N" in df.columns:
-                qnum = pd.to_numeric(df["QUANTITY RECEIVED"], errors="coerce")
-                is_part = df["P/N"].astype(str).str.strip().ne("")
-                df = df[~(is_part & qnum.notna() & (qnum <= 0))].copy()
+        drop_cols = ["__row", "__sort_key", OPTIONAL_SORT_COL]
+        df_out = df.drop(columns=[c for c in drop_cols if c in df.columns], errors="ignore")
 
-            # Order: WORKORDER ASC, then Sort ASC (1=WO,2=PO,3=TRANS), then stable by original row
-            df["__row"] = range(len(df))
-            if OPTIONAL_SORT_COL in df.columns:
-                df["__sort_key"] = pd.to_numeric(df[OPTIONAL_SORT_COL], errors="coerce").fillna(1).astype(int)
-            else:
-                df["__sort_key"] = 1
-            df.sort_values(by=["WORKORDER", "__sort_key", "__row"], ascending=[True, True, True], inplace=True)
+        st.dataframe(df_out, use_container_width=True, hide_index=True)
 
-            # Blank WORKORDER only for Sort in {2,3}
-            df.loc[df["__sort_key"].isin([2, 3]), "WORKORDER"] = ""
-
-            # Build display without helpers and without Sort column
-            drop_cols = ["__row", "__sort_key"]
-            if OPTIONAL_SORT_COL in df.columns:
-                drop_cols.append(OPTIONAL_SORT_COL)
-            df_out = df.drop(columns=drop_cols, errors="ignore")
-
-            st.markdown(f"**Work Orders — {chosen_loc} — {chosen_asset}**")
-            if df_out.empty:
-                st.info("No history found for this Asset.")
-            st.dataframe(df_out, use_container_width=True, hide_index=True)
-
-            # Downloads
-            c1, c2, _ = st.columns([1, 1, 3])
-            with c1:
-                st.download_button(
-                    label="⬇️ Excel (.xlsx)",
-                    data=to_xlsx_bytes(df_out, sheet="Workorders"),
-                    file_name=f"WorkOrders_{chosen_loc}_{chosen_asset}.xlsx".replace(" ", "_"),
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                )
-            with c2:
-                st.download_button(
-                    label="⬇️ Word (.docx)",
-                    data=to_docx_bytes(df_out, title=f"Work Orders — {chosen_loc} — {chosen_asset}"),
-                    file_name=f"WorkOrders_{chosen_loc}_{chosen_asset}.docx".replace(" ", "_"),
-                    mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                )
-
-    # =========================
-    # Tab 2: Work Orders (listing) — date-driven buckets, STATUS ignored
-    # =========================
-    with tab_list:
-        st.markdown("### Work Orders — Filtered Views (date-driven)")
-
-        if df_master is None:
-            st.warning(f"Sheet '{SHEET_WO_MASTER}' not found. Add it to the workbook to enable this page.")
-        else:
-            # Scope by exact Location (df_master['Location'] is already Location2→fallback NS Location)
-            loc_values_in_master = sorted(set(df_master["Location"].dropna().astype(str)))
-            visible_locs = sorted(set(loc_values_in_master).intersection(set(allowed_locations)))
-
-            loc_all_label = f"« All my locations ({len(visible_locs)}) »"
-            loc_options2 = [loc_all_label] + visible_locs
-            chosen_loc2 = st.selectbox("Location scope", options=loc_options2, index=0)
-
-            if chosen_loc2 == loc_all_label:
-                df_scope = df_master[df_master["Location"].isin(allowed_locations)].copy()
-            else:
-                df_scope = df_master[df_master["Location"] == chosen_loc2].copy()
-
-            # ---------- Optional: allowed users/teams from 'WO_Assignees' sheet ----------
-            assignees_users, assignees_teams = None, None
-            try:
-                df_assign = pd.read_excel(
-                    io.BytesIO(xlsx_bytes),
-                    sheet_name="WO_Assignees",
-                    dtype=str,
-                    keep_default_na=False,
-                    engine="openpyxl",
-                )
-                df_assign.columns = [str(c).strip() for c in df_assign.columns]
-                cols_low = {c.lower(): c for c in df_assign.columns}
-                col_loc  = cols_low.get("location")
-                col_user = cols_low.get("assigned to") or cols_low.get("user") or cols_low.get("username")
-                col_team = cols_low.get("team") or cols_low.get("teams")
-                if col_loc and (col_user or col_team):
-                    if chosen_loc2 == loc_all_label:
-                        df_a = df_assign[df_assign[col_loc].astype(str).isin(visible_locs)]
-                    else:
-                        df_a = df_assign[df_assign[col_loc].astype(str) == str(chosen_loc2)]
-                    if col_user:
-                        assignees_users = sorted(
-                            u for u in df_a[col_user].dropna().astype(str).str.strip().unique().tolist() if u
-                        )
-                    if col_team:
-                        assignees_teams = sorted(
-                            t for t in df_a[col_team].dropna().astype(str).str.strip().unique().tolist() if t
-                        )
-            except Exception:
-                pass
-
-            # ---------- User / Team filters (fallbacks if WO_Assignees missing) ----------
-            fallback_users = sorted(
-                u for u in (df_scope["Assigned To"] if "Assigned To" in df_scope.columns else pd.Series([], dtype=str))
-                    .dropna().astype(str).str.strip().unique().tolist() if u
+        # Downloads
+        c1, c2, _ = st.columns([1, 1, 6])
+        with c1:
+            st.download_button(
+                label="⬇️ Excel (.xlsx)",
+                data=to_xlsx_bytes(df_out, sheet="Workorders"),
+                file_name=f"WorkOrders_{chosen_loc}_{chosen_asset}.xlsx".replace(" ", "_"),
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             )
-            users = assignees_users if assignees_users is not None else fallback_users
-            sel_users = st.multiselect("Filter: Assigned User(s)", options=users, default=[])
-            if sel_users and "Assigned To" in df_scope.columns:
-                df_scope = df_scope[df_scope["Assigned To"].astype(str).str.strip().isin(sel_users)].copy()
-
-            # Teams (tokenize comma/semicolon if needed)
-            if assignees_teams is not None:
-                teams = assignees_teams
-            else:
-                raw_teams = (df_scope["Teams Assigned To"] if "Teams Assigned To" in df_scope.columns else pd.Series([], dtype=str)).fillna("").astype(str)
-                token_set = set()
-                for v in raw_teams:
-                    for t in re.split(r"[;,]", v):
-                        t = t.strip()
-                        if t:
-                            token_set.add(t)
-                teams = sorted(token_set)
-
-            sel_teams = st.multiselect("Filter: Team(s)", options=teams, default=[])
-            if sel_teams and "Teams Assigned To" in df_scope.columns:
-                sel_teams_norm = {t.strip() for t in sel_teams}
-                def team_hit(s: str) -> bool:
-                    if not s: return False
-                    parts = {p.strip() for p in re.split(r"[;,]", str(s)) if p.strip()}
-                    return bool(parts & sel_teams_norm)
-                df_scope = df_scope[df_scope["Teams Assigned To"].fillna("").astype(str).map(team_hit)].copy()
-
-            # ---------- Dates (vectorized) ----------
-            def s(col: str):
-                return df_scope[col] if col in df_scope.columns else pd.Series(pd.NA, index=df_scope.index)
-
-            created_dt   = pd.to_datetime(s("Created On"),   errors="coerce")
-            start_dt     = pd.to_datetime(s("Start Date"),   errors="coerce")
-            due_dt       = pd.to_datetime(s("Due Date"),     errors="coerce")
-            completed_dt = pd.to_datetime(s("Completed On"), errors="coerce")
-
-            today = pd.Timestamp.today().normalize()
-
-            # ---------- Buckets (STATUS ignored) ----------
-            is_completed = completed_dt.notna()
-            is_overdue   = (~is_completed) & due_dt.notna()   & (due_dt < today)
-            is_sched     = (~is_completed) & start_dt.notna() & (start_dt > today)
-            is_open      = (~is_completed) & (~is_overdue) & (~is_sched)
-            is_old_flag  = (~is_completed) & created_dt.notna() & (created_dt < today)
-
-            # ---------- Column sets per view ----------
-            def present(cols: list[str]) -> list[str]:
-                return [c for c in cols if c in df_scope.columns]
-
-            cols_all     = present(["WORKORDER","TITLE","ASSET","Created On","Start Date","Due Date","Completed On","Assigned To","Teams Assigned To","Location"])
-            cols_open    = present(["WORKORDER","TITLE","ASSET","Created On","Due Date","Assigned To","Teams Assigned To","Location"])
-            cols_overdue = present(["WORKORDER","TITLE","ASSET","Due Date","Assigned To","Teams Assigned To","Location"])
-            cols_sched   = present(["WORKORDER","TITLE","ASSET","Start Date","Due Date","Assigned To","Teams Assigned To","Location"])
-            cols_done    = present(["WORKORDER","TITLE","ASSET","Completed On","Assigned To","Teams Assigned To","Location"])
-            cols_old     = present(["WORKORDER","TITLE","ASSET","Created On","Due Date","Completed On","Assigned To","Teams Assigned To","Location"])
-
-            # ---------- Presenter ----------
-            def show(df_in: pd.DataFrame, label: str, cols: list[str], sort_keys: list[str] | None = None):
-                st.markdown(f"**{label} — rows: {len(df_in)}**")
-                if df_in.empty:
-                    st.info("No rows.")
-                    return
-                if sort_keys:
-                    df_in = df_in.copy()
-                    df_in.sort_values(by=[k for k in sort_keys if k in df_in.columns], inplace=True)
-                st.dataframe(df_in[cols] if cols else df_in, use_container_width=True, hide_index=True)
-                c1, c2, _ = st.columns([1,1,3])
-                with c1:
-                    st.download_button(
-                        "⬇️ Excel (.xlsx)",
-                        data=to_xlsx_bytes(df_in[cols] if cols else df_in, sheet=label.replace(" ","_")),
-                        file_name=f"WO_{label.replace(' ','_')}.xlsx",
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    )
-                with c2:
-                    st.download_button(
-                        "⬇️ Word (.docx)",
-                        data=to_docx_bytes(df_in[cols] if cols else df_in, title=f"Work Orders — {label}"),
-                        file_name=f"WO_{label.replace(' ','_')}.docx",
-                        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                    )
-
-            # ---------- Tabs ----------
-            t_all, t_open, t_overdue, t_sched, t_done, t_old = st.tabs(
-                ["All (in scope)", "Open (Today)", "Overdue", "Scheduled (Planning)", "Completed", "Old (flag)"]
+        with c2:
+            st.download_button(
+                label="⬇️ Word (.docx)",
+                data=to_docx_bytes(df_out, title=f"Work Orders — {chosen_loc} — {chosen_asset}"),
+                file_name=f"WorkOrders_{chosen_loc}_{chosen_asset}.docx".replace(" ", "_"),
+                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
             )
 
-            with t_all:
-                show(df_scope.copy(), "All (in scope)", cols_all, sort_keys=["Completed On","Due Date","Start Date","Created On"])
+    # ========= Page: Work Orders (listing) =========
+    else:
+        st.markdown("### Work Orders — Filtered Views (flags from workbook)")
 
-            with t_open:
-                show(df_scope[is_open].copy(), "Open (Today)", cols_open, sort_keys=["Due Date","Created On"])
+        # Load Workorders_Master + optional Users sheet
+        try:
+            df_master = load_wo_master_df(xlsx_bytes, SHEET_WO_MASTER)
+        except Exception as e:
+            st.error(f"Failed to read '{SHEET_WO_MASTER}': {e}")
+            st.stop()
 
-            with t_overdue:
-                show(df_scope[is_overdue].copy(), "Overdue", cols_overdue, sort_keys=["Due Date"])
+        opt_users = load_users_sheet(xlsx_bytes)  # may be None
 
-            with t_sched:
-                show(df_scope[is_sched].copy(), "Scheduled (Planning)", cols_sched, sort_keys=["Start Date","Due Date"])
+        # Limit to allowed locations up front
+        df_master = df_master[df_master["Location"].isin(allowed_locations)].copy()
+        total_in_scope = len(df_master)
 
-            with t_done:
-                show(df_scope[is_completed].copy(), "Completed", cols_done, sort_keys=["Completed On"])
+        # -------- top-of-page filters --------
+        c1, c2, c3, c4 = st.columns([2, 2, 2, 3])
 
-            with t_old:
-                show(df_scope[is_old_flag].copy(), "Old (flag)", cols_old, sort_keys=["Created On","Due Date"])
+        with c1:
+            loc_values = sorted(df_master["Location"].dropna().unique().tolist())
+            loc_all_label = f"« All my locations ({len(loc_values)}) »"
+            chosen_loc = st.selectbox("Location", options=[loc_all_label] + loc_values, index=0)
+
+        # Apply location filter (never broaden beyond allowed_locations)
+        if chosen_loc == loc_all_label:
+            df_scope = df_master.copy()
+        else:
+            df_scope = df_master[df_master["Location"] == chosen_loc].copy()
+
+        # Build user list:
+        # - If Users sheet exists, use that list.
+        # - Otherwise, derive from df_scope (to avoid leaking names outside this location scope).
+        with c2:
+            if opt_users is not None:
+                user_choices = ["— Any user —"] + opt_users
+            else:
+                derived_users = sorted([u for u in df_scope.get("Assigned to", pd.Series([], dtype=str))
+                                        .dropna().astype(str).str.strip().unique().tolist() if u])
+                user_choices = ["— Any user —"] + derived_users
+            sel_user = st.selectbox("Assigned user", options=user_choices, index=0)
+
+        with c3:
+            # Teams: tokenize comma/semicolon from df_scope (in-scope only)
+            raw_teams = df_scope.get("Teams Assigned to", pd.Series([], dtype=str)).fillna("").astype(str)
+            token_set = set()
+            for v in raw_teams:
+                for t in re.split(r"[;,]", v):
+                    t = t.strip()
+                    if t:
+                        token_set.add(t)
+            team_opts = ["— Any team —"] + sorted(token_set)
+            sel_team = st.selectbox("Team", options=team_opts, index=0)
+
+        with c4:
+            view = st.radio(
+                "View",
+                ["All", "Open", "Overdue", "Scheduled (Planning)", "Completed", "Old"],
+                horizontal=True,
+                index=1 if "IsOpen" in df_scope.columns else 0
+            )
+
+        # Apply user filter but do NOT reveal if they have work at other locations
+        if sel_user != "— Any user —":
+            before = len(df_scope)
+            df_scope = df_scope[df_scope["Assigned to"].astype(str).str.strip() == sel_user].copy()
+            after = len(df_scope)
+            if after == 0:
+                # Intentionally vague: doesn't say they have work elsewhere
+                st.warning("User not found at this location (or no work orders match).")
+                # Show empty table with headers to keep layout stable
+                st.dataframe(df_scope, use_container_width=True, hide_index=True)
+                st.stop()
+
+        # Apply team filter in-scope only
+        if sel_team != "— Any team —":
+            def team_hit(s: str) -> bool:
+                if not s: return False
+                parts = {p.strip() for p in re.split(r"[;,]", str(s)) if p.strip()}
+                return sel_team.strip() in parts
+            df_scope = df_scope[df_scope["Teams Assigned to"].fillna("").astype(str).map(team_hit)].copy()
+
+        # Bucket by workbook flags
+        def pick_view(df_in: pd.DataFrame) -> pd.DataFrame:
+            if view == "All" or not {"IsOpen","IsOverdue","IsScheduled","IsCompleted","IsOld"}.issubset(df_in.columns):
+                return df_in
+            m = {
+                "Open": "IsOpen",
+                "Overdue": "IsOverdue",
+                "Scheduled (Planning)": "IsScheduled",
+                "Completed": "IsCompleted",
+                "Old": "IsOld",
+            }
+            col = m.get(view)
+            return df_in[df_in[col]].copy() if col else df_in
+
+        df_view = pick_view(df_scope)
+
+        # Choose minimal helpful columns per view
+        def present(cols: list[str]) -> list[str]:
+            return [c for c in cols if c in df_view.columns]
+
+        cols_all        = present(["ID","Title","Asset","Created on","Planned Start Date","Due date","Started on","Completed on","Assigned to","Teams Assigned to","Location"])
+        cols_open       = present(["ID","Title","Asset","Created on","Due date","Assigned to","Teams Assigned to","Location"])
+        cols_overdue    = present(["ID","Title","Asset","Due date","Assigned to","Teams Assigned to","Location"])
+        cols_sched      = present(["ID","Title","Asset","Planned Start Date","Due date","Assigned to","Teams Assigned to","Location"])
+        cols_completed  = present(["ID","Title","Asset","Completed on","Assigned to","Teams Assigned to","Location"])
+        cols_old        = present(["ID","Title","Asset","Created on","Due date","Completed on","Assigned to","Teams Assigned to","Location"])
+
+        if view == "Open":
+            use_cols = cols_open or df_view.columns.tolist()
+            sort_keys = [k for k in ["Due date","Created on","Title"] if k in df_view.columns]
+        elif view == "Overdue":
+            use_cols = cols_overdue or df_view.columns.tolist()
+            sort_keys = [k for k in ["Due date","Title"] if k in df_view.columns]
+        elif view == "Scheduled (Planning)":
+            use_cols = cols_sched or df_view.columns.tolist()
+            sort_keys = [k for k in ["Planned Start Date","Due date","Title"] if k in df_view.columns]
+        elif view == "Completed":
+            use_cols = cols_completed or df_view.columns.tolist()
+            sort_keys = [k for k in ["Completed on","Title"] if k in df_view.columns]
+        elif view == "Old":
+            use_cols = cols_old or df_view.columns.tolist()
+            sort_keys = [k for k in ["Created on","Due date","Title"] if k in df_view.columns]
+        else:
+            use_cols = cols_all or df_view.columns.tolist()
+            sort_keys = [k for k in ["Completed on","Due date","Planned Start Date","Created on","Title"] if k in df_view.columns]
+
+        # Sort safely (dates already normalized as text YYYY-MM-DD; pandas sorts lexicographically OK)
+        if sort_keys:
+            df_view = df_view.sort_values(by=sort_keys, na_position="last")
+
+        st.caption(f"In scope: {total_in_scope}  •  After location/user/team filters: {len(df_scope)}  •  Showing ({view}): {len(df_view)}")
+        st.dataframe(df_view[use_cols], use_container_width=True, hide_index=True)
+
+        # Downloads
+        c1, c2, _ = st.columns([1, 1, 6])
+        with c1:
+            st.download_button(
+                "⬇️ Excel (.xlsx)",
+                data=to_xlsx_bytes(df_view[use_cols], sheet="WorkOrders"),
+                file_name=f"WorkOrders_{view.replace(' ','_')}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+        with c2:
+            st.download_button(
+                "⬇️ Word (.docx)",
+                data=to_docx_bytes(df_view[use_cols], title=f"Work Orders — {view}"),
+                file_name=f"WorkOrders_{view.replace(' ','_')}.docx",
+                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            )
+
 
