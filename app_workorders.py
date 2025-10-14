@@ -1,8 +1,9 @@
-# app_workorders.py
+# app_workorders.py — Parquet fast-path drop‑in
 # --------------------------------------------------------------
-# SPF Work Orders (reads local Workorders.xlsx by default)
+# SPF Work Orders (reads local Workorders.xlsx by default; Parquet cache)
 # Pages: Asset History • Work Orders • Service Report • Service History
-# Privacy-safe by Location; Dates normalized; “Data last updated” (from file mtime, ET)
+# Privacy-safe by Location; Dates normalized; “Data last updated” (ET)
+# Requires: pandas, pyarrow, xlsxwriter, streamlit-authenticator, openpyxl
 # --------------------------------------------------------------
 
 from __future__ import annotations
@@ -15,7 +16,7 @@ import pandas as pd
 import streamlit as st
 import yaml
 
-APP_VERSION = "2025.10.15h"
+APP_VERSION = "2025.10.15p2"
 
 # ---------- small CSS: hide Streamlit chrome / shrink controls ----------
 st.set_page_config(page_title="SPF Work Orders", page_icon="🧰", layout="wide")
@@ -41,12 +42,7 @@ except Exception:
     st.error("streamlit-authenticator not installed. Add it to requirements.txt")
     st.stop()
 
-try:
-    from docx import Document
-    from docx.shared import Pt
-except Exception:
-    st.error("python-docx not installed. Add it to requirements.txt")
-    st.stop()
+# NOTE: python-docx is imported lazily inside to_docx_bytes() for faster cold start
 
 # ---------- constants ----------
 LOCAL_XLSX_DEFAULT = "Workorders.xlsx"
@@ -180,7 +176,7 @@ def _canonize_headers(df: pd.DataFrame, canon: dict[str, set[str]]) -> pd.DataFr
     return df.rename(columns=mapping)
 
 def to_xlsx_bytes(df: pd.DataFrame, sheet: str) -> bytes:
-    import xlsxwriter
+    import xlsxwriter  # ensure dependency exists; used only on download
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="xlsxwriter") as w:
         df.to_excel(w, index=False, sheet_name=sheet)
@@ -192,6 +188,9 @@ def to_xlsx_bytes(df: pd.DataFrame, sheet: str) -> bytes:
     return buf.getvalue()
 
 def to_docx_bytes(df: pd.DataFrame, title: str) -> bytes:
+    # lazy import for faster cold start
+    from docx import Document
+    from docx.shared import Pt
     doc = Document()
     doc.styles["Normal"].font.name = "Calibri"
     doc.styles["Normal"].font.size = Pt(10)
@@ -212,13 +211,69 @@ def coerce_bool(s: pd.Series) -> pd.Series:
     out = m.map(lambda x: True if x in true_vals else (False if x in false_vals else False))
     return out.astype(bool)
 
+# ---------- fast I/O / Parquet layer ----------
+PARQUET_DIR = Path("faststore")
+PARQUET_DIR.mkdir(exist_ok=True)
+
+def _xlsx_path_from_cfg(cfg: dict) -> Path:
+    return Path((cfg.get("settings", {}) or {}).get("xlsx_path") or LOCAL_XLSX_DEFAULT)
+
+def _mtime(path: Path) -> float:
+    try:
+        return path.stat().st_mtime
+    except Exception:
+        return 0.0
+
+@st.cache_data(show_spinner=False)
+def get_local_xlsx_bytes_cached(xlsx_path_str: str, xlsx_mtime: float) -> bytes:
+    # cache keyed by path + mtime so reruns don't re-read file from disk
+    return Path(xlsx_path_str).read_bytes()
+
+def _pq_path(sheet: str) -> Path:
+    safe = re.sub(r"[^0-9A-Za-z_.-]+", "_", sheet.strip())
+    return PARQUET_DIR / f"{safe}.parquet"
+
+def _write_parquet(df: pd.DataFrame, sheet: str) -> None:
+    df.to_parquet(_pq_path(sheet), index=False)
+
+def _parquet_fresh(sheet: str, xlsx_path: Path) -> bool:
+    pq = _pq_path(sheet)
+    return pq.exists() and _mtime(pq) >= _mtime(xlsx_path)
+
+def _read_parquet_columns(sheet: str, columns: list[str] | None = None) -> pd.DataFrame:
+    return pd.read_parquet(_pq_path(sheet), columns=columns)
+
+def _rebuild_parquet_from_excel(xlsx_bytes: bytes, sheets_to_pull: list[str]) -> dict[str, pd.DataFrame]:
+    # Parse multiple sheets with one Excel decode, then write parquet
+    with pd.ExcelFile(io.BytesIO(xlsx_bytes), engine="openpyxl") as xf:
+        out = {}
+        for sh in sheets_to_pull:
+            try:
+                df = xf.parse(sh, dtype=str, keep_default_na=False)
+                df.columns = [str(c).strip() for c in df.columns]
+                _write_parquet(df, sh)
+                out[sh] = df
+            except Exception:
+                pass
+    return out
+
+def parquet_button_and_refresh(xlsx_path: Path, xlsx_bytes: bytes) -> None:
+    with st.sidebar.expander("⚡ Data cache"):
+        if st.button("Rebuild Parquet cache now"):
+            _rebuild_parquet_from_excel(xlsx_bytes, [
+                SHEET_WORKORDERS, SHEET_ASSET_MASTER, SHEET_WO_MASTER,
+                *SHEET_WO_SERVICE_CANDS, *SHEET_SERVICE_CANDIDATES, *SHEET_USERS_CANDIDATES
+            ])
+            st.success("Parquet cache rebuilt.")
+            st.cache_data.clear()
+            st.rerun()
+
 # ---------- data access ----------
 def get_local_xlsx_bytes(cfg: dict) -> bytes:
-    xl = (cfg.get("settings", {}) or {}).get("xlsx_path") or LOCAL_XLSX_DEFAULT
-    p = Path(xl)
+    p = _xlsx_path_from_cfg(cfg)
     if not p.exists():
         raise FileNotFoundError(f"Local Excel not found: {p.resolve()}")
-    return p.read_bytes()
+    return get_local_xlsx_bytes_cached(str(p), _mtime(p))
 
 def get_data_last_updated_local(cfg: dict) -> str | None:
     xl = (cfg.get("settings", {}) or {}).get("xlsx_path") or LOCAL_XLSX_DEFAULT
@@ -229,42 +284,70 @@ def get_data_last_updated_local(cfg: dict) -> str | None:
     except Exception:
         return None
 
-# ---------- loaders ----------
+# ---------- loaders (Parquet fast-path) ----------
 @st.cache_data(show_spinner=False)
-def load_workorders_df(xlsx_bytes: bytes, sheet: str) -> pd.DataFrame:
-    df = pd.read_excel(io.BytesIO(xlsx_bytes), sheet_name=sheet, dtype=str, keep_default_na=False, engine="openpyxl")
+def load_workorders_df(xlsx_mtime: float, xlsx_path_str: str) -> pd.DataFrame:
+    need = REQUIRED_WO_COLS + ([OPTIONAL_SORT_COL] if OPTIONAL_SORT_COL else [])
+    sheet = SHEET_WORKORDERS
+    xlsx_path = Path(xlsx_path_str)
+
+    if _parquet_fresh(sheet, xlsx_path):
+        df = _read_parquet_columns(sheet, columns=[c for c in need if c])
+    else:
+        _rebuild_parquet_from_excel(get_local_xlsx_bytes_cached(xlsx_path_str, xlsx_mtime), [sheet])
+        df = _read_parquet_columns(sheet, columns=[c for c in need if c])
+
     df.columns = [str(c).strip() for c in df.columns]
     missing = [c for c in REQUIRED_WO_COLS if c not in df.columns]
     if missing:
         raise ValueError(f"Sheet '{sheet}' missing columns: {missing}\nFound: {list(df.columns)}")
-    cols = REQUIRED_WO_COLS[:]
-    if OPTIONAL_SORT_COL in df.columns:
-        cols += [OPTIONAL_SORT_COL]
-    df = df[cols].copy()
-    df["COMPLETED ON"] = df["COMPLETED ON"].map(_norm_date_any)
+
+    df = df[[c for c in need if c in df.columns]].copy()
+    if "COMPLETED ON" in df.columns:
+        df["COMPLETED ON"] = df["COMPLETED ON"].map(_norm_date_any)
     for c in df.columns:
-        df[c] = df[c].map(lambda x: x.strip() if isinstance(x, str) else x)
+        if df[c].dtype == object:
+            df[c] = df[c].astype("string").str.strip()
+    for catcol in ("Location","ASSET"):
+        if catcol in df.columns:
+            df[catcol] = df[catcol].astype("category")
     return df
 
 @st.cache_data(show_spinner=False)
-def load_asset_master_df(xlsx_bytes: bytes, sheet: str) -> pd.DataFrame:
-    df = pd.read_excel(io.BytesIO(xlsx_bytes), sheet_name=sheet, dtype=str, keep_default_na=False, engine="openpyxl")
+def load_asset_master_df(xlsx_mtime: float, xlsx_path_str: str) -> pd.DataFrame:
+    sheet = SHEET_ASSET_MASTER
+    xlsx_path = Path(xlsx_path_str)
+    if _parquet_fresh(sheet, xlsx_path):
+        df = _read_parquet_columns(sheet, columns=ASSET_MASTER_COLS)
+    else:
+        _rebuild_parquet_from_excel(get_local_xlsx_bytes_cached(xlsx_path_str, xlsx_mtime), [sheet])
+        df = _read_parquet_columns(sheet, columns=ASSET_MASTER_COLS)
+
     df.columns = [str(c).strip() for c in df.columns]
     for c in ASSET_MASTER_COLS:
         if c not in df.columns:
             raise ValueError(f"Sheet '{sheet}' missing '{c}'")
-    for c in ASSET_MASTER_COLS:
-        df[c] = df[c].map(lambda x: x.strip() if isinstance(x, str) else x)
+        df[c] = df[c].astype("string").str.strip()
     df = df[(df["Location"] != "") & (df["ASSET"] != "")]
+    df["Location"] = df["Location"].astype("category")
+    df["ASSET"] = df["ASSET"].astype("category")
     return df[ASSET_MASTER_COLS].copy()
 
 @st.cache_data(show_spinner=False)
-def load_wo_master_df(xlsx_bytes: bytes, sheet: str) -> pd.DataFrame:
-    df = pd.read_excel(io.BytesIO(xlsx_bytes), sheet_name=sheet, dtype=str, keep_default_na=False, engine="openpyxl")
+def load_wo_master_df(xlsx_mtime: float, xlsx_path_str: str) -> pd.DataFrame:
+    sheet = SHEET_WO_MASTER
+    xlsx_path = Path(xlsx_path_str)
+    if _parquet_fresh(sheet, xlsx_path):
+        df = _read_parquet_columns(sheet, columns=None)
+    else:
+        _rebuild_parquet_from_excel(get_local_xlsx_bytes_cached(xlsx_path_str, xlsx_mtime), [sheet])
+        df = _read_parquet_columns(sheet, columns=None)
+
     df.columns = [str(c).strip() for c in df.columns]
     have = [c for c in MASTER_REQUIRED if c in df.columns]
     if have:
         df = df[have].copy()
+
     for dc in ("Created on","Planned Start Date","Due date","Started on","Completed on"):
         if dc in df.columns:
             df[dc] = df[dc].map(_norm_date_any)
@@ -272,51 +355,71 @@ def load_wo_master_df(xlsx_bytes: bytes, sheet: str) -> pd.DataFrame:
         if bc in df.columns:
             df[bc] = coerce_bool(df[bc])
     for c in [x for x in ["ID","Title","Description","Asset","Status","Assigned to","Teams Assigned to","Completed by","Location"] if x in df.columns]:
-        df[c] = df[c].astype(str).str.strip()
+        df[c] = df[c].astype("string").str.strip()
     if "ID" in df.columns:
-        df["ID"] = df["ID"].astype(str).str.strip()
+        df["ID"] = df["ID"].astype("string").str.strip()
+
+    for catcol in ("Location","Assigned to","Asset"):
+        if catcol in df.columns:
+            df[catcol] = df[catcol].astype("category")
     return df
 
-# Service Report loader
 @st.cache_data(show_spinner=False)
-def load_service_report_df(xlsx_bytes: bytes):
+def load_service_report_df(xlsx_mtime: float, xlsx_path_str: str):
+    xlsx_path = Path(xlsx_path_str)
+
     for nm in SHEET_SERVICE_CANDIDATES:
-        try:
-            raw = pd.read_excel(io.BytesIO(xlsx_bytes), sheet_name=nm, dtype=str, keep_default_na=False, engine="openpyxl")
-            raw.columns = [str(c).strip() for c in raw.columns]
-            canon = _canonize_headers(raw.copy(), SERVICE_REPORT_CANON)
-            if "Date" in canon.columns: canon["Date"] = canon["Date"].map(_norm_date_any)
-            if "Due Date" in canon.columns: canon["Due Date"] = canon["Due Date"].map(_norm_date_any)
-            # numeric helpers
-            for col, newcol in [("Schedule","__Schedule_num"), ("Remaining","__Remaining_num"), ("Percent Remaining","__PctRemain_num")]:
-                if col in canon.columns:
-                    canon[newcol] = pd.to_numeric(canon[col].astype(str).str.replace("%","", regex=False), errors="coerce")
+        if _parquet_fresh(nm, xlsx_path):
+            raw = _read_parquet_columns(nm, columns=None)
+        else:
+            try:
+                _rebuild_parquet_from_excel(get_local_xlsx_bytes_cached(xlsx_path_str, xlsx_mtime), [nm])
+                if _parquet_fresh(nm, xlsx_path):
+                    raw = _read_parquet_columns(nm, columns=None)
                 else:
-                    canon[newcol] = pd.NA
-            if "__PctRemain_num" in canon.columns:
-                pr = pd.to_numeric(canon["__PctRemain_num"], errors="coerce")
-                canon["__PctRemain_num"] = pr.where((pr.isna()) | (pr <= 1.0), pr/100.0)
-            canon["__MeterType_norm"] = canon.get("Meter Type", pd.Series([], dtype=str)).astype(str).str.strip().str.lower() if "Meter Type" in canon.columns else ""
-            canon["__Due_dt"] = pd.to_datetime(canon["Due Date"], errors="coerce") if "Due Date" in canon.columns else pd.NaT
-            for c in [x for x in ["WO_ID","Title","Service","Asset","Location","User","Notes","Status","MReading"] if x in canon.columns]:
-                canon[c] = canon[c].astype(str).str.strip()
-            return raw, canon, nm
-        except Exception:
-            continue
+                    continue
+            except Exception:
+                continue
+
+        raw.columns = [str(c).strip() for c in raw.columns]
+        canon = _canonize_headers(raw.copy(), SERVICE_REPORT_CANON)
+        if "Date" in canon.columns: canon["Date"] = canon["Date"].map(_norm_date_any)
+        if "Due Date" in canon.columns: canon["Due Date"] = canon["Due Date"].map(_norm_date_any)
+
+        for col, newcol in [("Schedule","__Schedule_num"), ("Remaining","__Remaining_num"), ("Percent Remaining","__PctRemain_num")]:
+            if col in canon.columns:
+                canon[newcol] = pd.to_numeric(canon[col].astype(str).str.replace("%","", regex=False), errors="coerce")
+            else:
+                canon[newcol] = pd.NA
+        if "__PctRemain_num" in canon.columns:
+            pr = pd.to_numeric(canon["__PctRemain_num"], errors="coerce")
+            canon["__PctRemain_num"] = pr.where((pr.isna()) | (pr <= 1.0), pr/100.0)
+
+        canon["__MeterType_norm"] = canon.get("Meter Type", pd.Series([], dtype=str)).astype(str).str.strip().str.lower() if "Meter Type" in canon.columns else ""
+        canon["__Due_dt"] = pd.to_datetime(canon["Due Date"], errors="coerce") if "Due Date" in canon.columns else pd.NaT
+        for c in [x for x in ["WO_ID","Title","Service","Asset","Location","User","Notes","Status","MReading"] if x in canon.columns]:
+            canon[c] = canon[c].astype("string").str.strip()
+        return raw, canon, nm
+
     return None, None, None
 
-# Service History loader — returns (df, used_sheet)
 @st.cache_data(show_spinner=False)
-def load_service_history_df(xlsx_bytes: bytes):
+def load_service_history_df(xlsx_mtime: float, xlsx_path_str: str):
+    xlsx_path = Path(xlsx_path_str)
     last_err = None
     for nm in SHEET_WO_SERVICE_CANDS:
         try:
-            df = pd.read_excel(io.BytesIO(xlsx_bytes), sheet_name=nm, dtype=str, keep_default_na=False, engine="openpyxl")
+            if _parquet_fresh(nm, xlsx_path):
+                df = _read_parquet_columns(nm, columns=None)
+            else:
+                _rebuild_parquet_from_excel(get_local_xlsx_bytes_cached(xlsx_path_str, xlsx_mtime), [nm])
+                df = _read_parquet_columns(nm, columns=None)
+
             df.columns = [str(c).strip() for c in df.columns]
             df = _canonize_headers(df, SERVICE_HISTORY_CANON)
             if "Date" in df.columns: df["Date"] = df["Date"].map(_norm_date_any)
             for c in [x for x in ["WO_ID","Title","Service","Asset","Location2","User","Notes","Status","MReading","MHours"] if x in df.columns]:
-                df[c] = df[c].astype(str).str.strip()
+                df[c] = df[c].astype("string").str.strip()
             keep = [c for c in ["Date","WO_ID","Title","Service","MReading","MHours","Asset","User","Location2","Notes","Status"] if c in df.columns]
             df = df[keep].copy() if keep else df
             return df, nm
@@ -326,15 +429,22 @@ def load_service_history_df(xlsx_bytes: bytes):
     return None, f"{last_err}" if last_err else None
 
 @st.cache_data(show_spinner=False)
-def load_users_sheet(xlsx_bytes: bytes) -> list[str] | None:
+def load_users_sheet(xlsx_mtime: float, xlsx_path_str: str) -> list[str] | None:
+    xlsx_path = Path(xlsx_path_str)
     for name in SHEET_USERS_CANDIDATES:
         try:
-            dfu = pd.read_excel(io.BytesIO(xlsx_bytes), sheet_name=name, dtype=str, keep_default_na=False, engine="openpyxl")
+            if _parquet_fresh(name, xlsx_path):
+                dfu = _read_parquet_columns(name, columns=None)
+            else:
+                _rebuild_parquet_from_excel(get_local_xlsx_bytes_cached(xlsx_path_str, xlsx_mtime), [name])
+                dfu = _read_parquet_columns(name, columns=None)
             cols_low = {c.lower(): c for c in dfu.columns}
             col = cols_low.get("user")
-            if not col: continue
+            if not col:
+                continue
             users = [u.strip() for u in dfu[col].astype(str).tolist() if str(u).strip()]
-            users = sorted(dict.fromkeys(users)); return users
+            users = sorted(dict.fromkeys(users))
+            return users
         except Exception:
             pass
     return None
@@ -376,16 +486,20 @@ else:
         index=1
     )
 
-    # Load workbook bytes
+    # Load workbook bytes + expose Parquet cache tools
+    xlsx_path = _xlsx_path_from_cfg(cfg)
     try:
         xlsx_bytes = get_local_xlsx_bytes(cfg)
     except Exception as e:
         st.error(f"Could not load Excel: {e}")
         st.stop()
 
+    parquet_button_and_refresh(xlsx_path, xlsx_bytes)
+    xmtime = _mtime(xlsx_path)
+
     # Access control: Locations from Asset_Master
     try:
-        df_am = load_asset_master_df(xlsx_bytes, SHEET_ASSET_MASTER)
+        df_am = load_asset_master_df(xmtime, str(xlsx_path))
     except Exception as e:
         st.error(f"Failed to read Asset_Master: {e}")
         st.stop()
@@ -420,7 +534,7 @@ else:
             st.stop()
 
         try:
-            df_all = load_workorders_df(xlsx_bytes, SHEET_WORKORDERS)
+            df_all = load_workorders_df(xmtime, str(xlsx_path))
         except Exception as e:
             st.error(f"Failed to read Workorders (history): {e}")
             st.stop()
@@ -448,14 +562,14 @@ else:
             st.download_button(
                 label="⬇️ Excel (.xlsx)",
                 data=to_xlsx_bytes(df_out, sheet="Workorders"),
-                file_name=f"WorkOrders_{chosen_loc}_{chosen_asset}.xlsx".replace(" ","_"),
+                file_name=f"WorkOrders_{chosen_loc}_{chosen_asset}.xlsx".replace(" ", "_"),
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             )
         with c2:
             st.download_button(
                 label="⬇️ Word (.docx)",
                 data=to_docx_bytes(df_out, title=f"Work Orders — {chosen_loc} — {chosen_asset}"),
-                file_name=f"WorkOrders_{chosen_loc}_{chosen_asset}.docx".replace(" ","_"),
+                file_name=f"WorkOrders_{chosen_loc}_{chosen_asset}.docx".replace(" ", "_"),
                 mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
             )
         st.stop()
@@ -465,12 +579,12 @@ else:
         st.markdown("### Work Orders — Filtered Views (flags from workbook)")
 
         try:
-            df_master = load_wo_master_df(xlsx_bytes, SHEET_WO_MASTER)
+            df_master = load_wo_master_df(xmtime, str(xlsx_path))
         except Exception as e:
             st.error(f"Failed to read '{SHEET_WO_MASTER}': {e}")
             st.stop()
 
-        opt_users = load_users_sheet(xlsx_bytes)
+        opt_users = load_users_sheet(xmtime, str(xlsx_path))
         df_master = df_master[df_master["Location"].isin(allowed_locations)].copy()
         total_in_scope = len(df_master)
 
@@ -596,7 +710,7 @@ else:
     if page == "🧾 Service Report":
         st.markdown("### Service Report")
 
-        raw_sr, canon_sr, source_sheet = load_service_report_df(xlsx_bytes)
+        raw_sr, canon_sr, source_sheet = load_service_report_df(xmtime, str(xlsx_path))
         if raw_sr is None:
             st.warning("No 'Service Report' sheet found.")
             st.stop()
@@ -632,10 +746,14 @@ else:
 
         t_report, t_due, t_over = st.tabs(["Report", "Coming Due", "Overdue"])
 
-        # --- Report (as-is, minus Schedule/Today) ---
+        # --- Report (as-is, minus Schedule/Today) with Date normalized to date-only ---
         with t_report:
             drop_cols = [c for c in ["Schedule","Today"] if c in raw_show.columns]
             show_rep = raw_show.drop(columns=drop_cols) if drop_cols else raw_show
+            # Normalize a column explicitly named 'Date' to YYYY-MM-DD for display only
+            if "Date" in show_rep.columns:
+                show_rep = show_rep.copy()
+                show_rep["Date"] = show_rep["Date"].map(_norm_date_any)
             st.caption(f"Source: {source_sheet}  •  Rows: {len(show_rep)}  •  No filters other than Location.")
             st.dataframe(show_rep, use_container_width=True, hide_index=True)
             c1, c2, _ = st.columns([1,1,6])
@@ -648,14 +766,17 @@ else:
                                    file_name="Service_Report.docx",
                                    mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
 
-        # Helper: compute Coming Due / Overdue frames
+        # Helper: compute Coming Due / Overdue frames (vectorized thresholds)
         def _due_frames(df_can: pd.DataFrame):
             if df_can is None or df_can.empty:
                 return pd.DataFrame(), pd.DataFrame()
             df = df_can.copy()
-            def row_threshold(r) -> float:
-                mt = str(r.get("__MeterType_norm","")).lower()
-                return 0.05 if ("mile" in mt) else 0.10
+            # 5% threshold if meter type mentions miles, else 10%
+            mt = df.get("__MeterType_norm")
+            thr_series = pd.Series(0.10, index=df.index)
+            if mt is not None:
+                thr_series = thr_series.where(~mt.astype(str).str.contains("mile"), 0.05)
+
             conds = []
             condA = (
                 df["__Schedule_num"].notna() &
@@ -664,14 +785,12 @@ else:
                 (pd.to_numeric(df["__Remaining_num"], errors="coerce") >= 0)
             )
             if condA.any():
-                thrA = df.apply(row_threshold, axis=1)
-                condA2 = pd.to_numeric(df["__Remaining_num"], errors="coerce") <= (pd.to_numeric(df["__Schedule_num"], errors="coerce") * thrA)
+                condA2 = pd.to_numeric(df["__Remaining_num"], errors="coerce") <= (pd.to_numeric(df["__Schedule_num"], errors="coerce") * thr_series)
                 conds.append(condA & condA2)
             if "__PctRemain_num" in df.columns:
                 condB = df["__PctRemain_num"].notna()
                 if condB.any():
-                    thrB = df.apply(row_threshold, axis=1)
-                    condB2 = pd.to_numeric(df["__PctRemain_num"], errors="coerce") <= thrB
+                    condB2 = pd.to_numeric(df["__PctRemain_num"], errors="coerce") <= thr_series
                     conds.append(condB & condB2)
             coming_due_mask = pd.Series(False, index=df.index)
             for c in conds: coming_due_mask |= c
@@ -718,7 +837,6 @@ else:
             if overdue_df.empty:
                 st.info("No overdue items found.")
             else:
-                # ensure MReading sits right after Schedule if present
                 base = ["WO_ID","Title","Service","Asset","Location","Date","User","Status",
                         "Schedule","MReading","Remaining","Percent Remaining","Meter Type","Due Date","Notes"]
                 show = overdue_df[[c for c in base if c in overdue_df.columns]].copy()
@@ -740,7 +858,7 @@ else:
     if page == "📚 Service History":
         st.markdown("### Service History")
 
-        df_hist, used_sheet_or_err = load_service_history_df(xlsx_bytes)
+        df_hist, used_sheet_or_err = load_service_history_df(xmtime, str(xlsx_path))
         if df_hist is None or df_hist.empty:
             msg = used_sheet_or_err or "unknown error"
             st.warning(f"No Service History data found. Tried: {SHEET_WO_SERVICE_CANDS}. Last error: {msg}")
@@ -803,4 +921,7 @@ else:
                 mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
             )
         st.stop()
+
+# EOF
+
 
