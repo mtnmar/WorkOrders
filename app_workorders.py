@@ -3,7 +3,6 @@
 # SPF Work Orders (reads local Workorders.xlsx by default; Parquet cache)
 # Pages: Asset History • Work Orders • Service Report • Service History
 # Privacy-safe by Location; Dates normalized; “Data last updated” (ET)
-# Requires: pandas, pyarrow, xlsxwriter, streamlit-authenticator, openpyxl
 # --------------------------------------------------------------
 
 from __future__ import annotations
@@ -16,7 +15,7 @@ import pandas as pd
 import streamlit as st
 import yaml
 
-APP_VERSION = "2025.10.15p2"
+APP_VERSION = "2025.10.15p"
 
 # ---------- small CSS: hide Streamlit chrome / shrink controls ----------
 st.set_page_config(page_title="SPF Work Orders", page_icon="🧰", layout="wide")
@@ -921,7 +920,5 @@ else:
                 mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
             )
         st.stop()
-
-# EOF
 
 
