@@ -1,18 +1,15 @@
-# Create a ready-to-run Streamlit app that uses ONLY local Excel files
-# and includes BOTH the Cross Reference page and the new "Service Procedure Filter" page.
-# I will save it as a .py (for immediate use) and a .txt ("notepad") with the same contents.
-
-code = r'''# app_workorders.py — Parquet fast-path + local Service Procedure Filter
+# app_workorders.py — Parquet fast-path drop‑in + CrossRef + Service Procedures (GitHub)
 # --------------------------------------------------------------
 # SPF Work Orders (reads local Workorders.xlsx by default; Parquet cache)
-# Pages: Asset History • Work Orders • 🔁 Cross Reference • 🧰 Service Procedure Filter • Service Report • Service History
+# Pages: Asset History • Work Orders • Cross Reference • Service Report • Service History • Service Procedure Filter
 # Privacy-safe by Location; Dates normalized; “Data last updated” (ET)
-# Requires: pandas, pyarrow, xlsxwriter, streamlit-authenticator, openpyxl
+# Requires: pandas, pyarrow, xlsxwriter, streamlit-authenticator, openpyxl, requests
 # (Optional) python-docx for Word exports from app buttons
 # --------------------------------------------------------------
 
 from __future__ import annotations
-import io, re, os
+import io, re, os, base64, time, platform, tempfile
+from urllib.parse import quote
 from pathlib import Path
 from collections.abc import Mapping
 from datetime import datetime, timedelta, timezone
@@ -20,6 +17,7 @@ from datetime import datetime, timedelta, timezone
 import pandas as pd
 import streamlit as st
 import yaml
+import requests
 
 APP_VERSION = "2025.10.15p4"
 
@@ -163,7 +161,7 @@ def _norm_date_any(s: str) -> str:
 
 def _norm_key(x: str) -> str:
     s = re.sub(r"[^0-9a-z]+", " ", str(x).lower())
-    return re.sub(r"\\s+", " ", s).strip()
+    return re.sub(r"\s+", " ", s).strip()
 
 def _canonize_headers(df: pd.DataFrame, canon: dict[str, set[str]]) -> pd.DataFrame:
     low_to_orig = {str(c).strip().lower(): str(c) for c in df.columns}
@@ -174,7 +172,7 @@ def _canonize_headers(df: pd.DataFrame, canon: dict[str, set[str]]) -> pd.DataFr
             mapping[low_to_orig[key_l]] = key
             continue
         for low, orig in low_to_orig.items():
-            low2 = re.sub(r"\\s+", " ", low)
+            low2 = re.sub(r"\s+", " ", low)
             if low in aliases or low2 in aliases:
                 mapping[orig] = key
                 break
@@ -255,7 +253,7 @@ XREF_NAME_CANDIDATES = [
 XREF_BRAND_PRIORITY = ["Caterpillar", "Donaldson", "Fleetguard", "Baldwin", "Wix", "Fram"]
 
 # ----- normalization helpers -----
-_XREF_NBSP = "\\u00A0"
+_XREF_NBSP = "\u00A0"
 
 def xref_normalize_pn(pn) -> str:
     if pd.isna(pn): return ""
@@ -275,7 +273,7 @@ def xref_norm_text(s: str) -> str:
     if s is None: return ""
     s = str(s).upper().strip().replace(_XREF_NBSP, " ")
     s = re.sub(r"[^A-Z0-9 ]+", " ", s)
-    s = re.sub(r"\\s+", " ", s)
+    s = re.sub(r"\s+", " ", s)
     return s
 
 # ----- Excel open (supports .xlsm/.xlsx) -----
@@ -594,8 +592,6 @@ def xref_inventory_lookup_per_xref(inv_df: pd.DataFrame, cross_df: pd.DataFrame,
     sort_cols = [c for c in ["Inventory PN","Name","Location2","Location","Area"] if c in merged.columns]
     return merged.sort_values(by=sort_cols).reset_index(drop=True)
 
-
-
 # ---------- fast I/O / Parquet layer ----------
 PARQUET_DIR = Path("faststore")
 PARQUET_DIR.mkdir(exist_ok=True)
@@ -647,9 +643,7 @@ def parquet_button_and_refresh(xlsx_path: Path, xlsx_bytes: bytes) -> None:
         if st.button("Rebuild Parquet cache now"):
             _rebuild_parquet_from_excel(xlsx_bytes, [
                 SHEET_WORKORDERS, SHEET_ASSET_MASTER, SHEET_WO_MASTER,
-                *SHEET_WO_SERVICE_CANDS, *SHEET_SERVICE_CANDIDATES, *SHEET_USERS_CANDIDATES,
-                # Service Procedure Filter sheets (local)
-                "Service Procedures", "Controls", "Parts_Master", "Filter_List"
+                *SHEET_WO_SERVICE_CANDS, *SHEET_SERVICE_CANDIDATES, *SHEET_USERS_CANDIDATES
             ])
             st.success("Parquet cache rebuilt.")
             st.cache_data.clear()
@@ -687,7 +681,7 @@ def load_workorders_df(xlsx_mtime: float, xlsx_path_str: str) -> pd.DataFrame:
     df.columns = [str(c).strip() for c in df.columns]
     missing = [c for c in REQUIRED_WO_COLS if c not in df.columns]
     if missing:
-        raise ValueError(f"Sheet '{sheet}' missing columns: {missing}\\nFound: {list(df.columns)}")
+        raise ValueError(f"Sheet '{sheet}' missing columns: {missing}\nFound: {list(df.columns)}")
 
     df = df[[c for c in need if c in df.columns]].copy()
     if "COMPLETED ON" in df.columns:
@@ -836,214 +830,502 @@ def load_users_sheet(xlsx_mtime: float, xlsx_path_str: str) -> list[str] | None:
             pass
     return None
 
-# ---------- Service Procedure Filter (LOCAL workbook) ----------
-# Sheets expected in the SAME local Excel file as the rest of the app (Workorders.xlsx by default)
-SPF_SHEET_PROC     = "Service Procedures"
-SPF_SHEET_CTRL     = "Controls"
-SPF_SHEET_INV      = "Parts_Master"
-SPF_SHEET_XREF     = "Filter_List"  # optional
-
-SPF_COL_ASSET    = "Asset"
-SPF_COL_SERIAL   = "Serial"
-SPF_COL_SERVICE  = "Service"
-SPF_COL_TASKNO   = "Task #"
-SPF_COL_TASK     = "Task"
-SPF_COL_LOC_LIST = "Locations"
-
-SPF_INV_COL_PN    = "Part Numbers"
-SPF_INV_COL_QTY   = "Quantity in Stock"
-SPF_INV_COL_LOC   = "Location"
-SPF_INV_COL_AREA  = "Area"
-SPF_INV_COL_LOC2  = "Location2"
-
-SPF_XREF_COL_CAT  = "Cat"
-SPF_XREF_COL_DON  = "Donaldson P/N"
-
-SPF_PART_PREFIXES = ("Part Number_", "Part Type_", "Description_", "Qty_")
-
-SPF_INV_NAME_CANDIDATES = [
-    "Name", "Description", "Item", "Part Name", "Description 1",
-    "Item Description", "Product Name"
-]
-
-def spf_normalize_pn(pn):
-    if pd.isna(pn): return ""
-    return "".join(ch for ch in str(pn).upper() if ch.isalnum())
-
-_SPF_SPLIT_RE = re.compile(r"[,\\;/\\s]+")
-
-def spf_token_norms_from_text(s: str):
-    if s is None: return []
-    toks = []
-    for piece in _SPF_SPLIT_RE.split(str(s).upper()):
-        piece = piece.strip()
-        if not piece:
-            continue
-        n = spf_normalize_pn(piece)
-        if n and any(ch.isdigit() for ch in n):
-            toks.append(n)
-    return toks
-
-def spf_semi_join(tokens):
-    uniq, seen = [], set()
-    for t in tokens:
-        if t not in seen:
-            uniq.append(t); seen.add(t)
-    return ";" + ";".join(uniq) + ";" if uniq else ";"
-
-def spf_clean_space(s):
-    if s is None: return ""
-    return str(s).replace("\\u00A0", "").replace("\\t", "").strip()
-
-@st.cache_data(show_spinner=False)
-def spf_load_sheet(name: str, xlsx_mtime: float, xlsx_path_str: str) -> pd.DataFrame | None:
-    xlsx_path = Path(xlsx_path_str)
-    if _parquet_fresh(name, xlsx_path):
-        try:
-            return _read_parquet_columns(name, columns=None)
-        except Exception:
-            pass
+# ---------- Service Procedure Filter (GitHub-backed) — page function ----------
+def render_service_procedure_page():
+    st.markdown("### Service Procedure Filter")
+    # ---------- Optional Word export ----------
     try:
-        _rebuild_parquet_from_excel(get_local_xlsx_bytes_cached(xlsx_path_str, xlsx_mtime), [name])
-        return _read_parquet_columns(name, columns=None)
+        from docx import Document
+        from docx.shared import Inches, Pt
+        from docx.enum.section import WD_ORIENT
+        from docx.oxml import OxmlElement
+        from docx.oxml.ns import qn
+        DOCX_AVAILABLE = True
     except Exception:
-        return None
+        DOCX_AVAILABLE = False
 
-@st.cache_data(show_spinner=False)
-def spf_load_all(xlsx_mtime: float, xlsx_path_str: str):
-    df_proc = spf_load_sheet(SPF_SHEET_PROC, xlsx_mtime, xlsx_path_str)
-    df_ctrl = spf_load_sheet(SPF_SHEET_CTRL, xlsx_mtime, xlsx_path_str)
-    df_inv  = spf_load_sheet(SPF_SHEET_INV,  xlsx_mtime, xlsx_path_str)
-    df_xref = spf_load_sheet(SPF_SHEET_XREF, xlsx_mtime, xlsx_path_str)
-    return df_proc, df_ctrl, df_inv, (df_xref if df_xref is not None else pd.DataFrame())
+    SHOW_PRINT = (platform.system() == "Windows") and (os.environ.get("ALLOW_SERVER_PRINT") == "1")
 
-def spf_prepare_inventory(df_inv: pd.DataFrame):
-    df = df_inv.copy()
-    inv_name_col = next((c for c in SPF_INV_NAME_CANDIDATES if c in df.columns), None)
-    def _build_tok_name(row):
-        if not inv_name_col: return ";"
-        toks = spf_token_norms_from_text(row.get(inv_name_col, ""))
-        return spf_semi_join(toks)
-    def _build_tok_pn(row):
-        toks = spf_token_norms_from_text(row.get(SPF_INV_COL_PN, ""))
-        return spf_semi_join(toks)
-    df["_TOK_NAME_SEMI"] = df.apply(_build_tok_name, axis=1) if inv_name_col else ";"
-    df["_TOK_PN_SEMI"]   = df.apply(_build_tok_pn,   axis=1)
-    df["_LOC2_CLEAN"] = df.get(SPF_INV_COL_LOC2, pd.Series([""]*len(df))).map(spf_clean_space)
-    df["_QTY_NUM"]    = pd.to_numeric(df.get(SPF_INV_COL_QTY, pd.Series([0]*len(df))), errors="coerce").fillna(0)
-    return df, inv_name_col
+    # ---------- REQUIRED SECRETS ----------
+    GH_OWNER  = st.secrets.get("GH_OWNER")
+    GH_REPO   = st.secrets.get("GH_REPO")
+    GH_BRANCH = st.secrets.get("GH_BRANCH", "main")
+    GH_PATH   = st.secrets.get("GH_WORKBOOK_PATH")
+    GH_TOKEN  = st.secrets.get("GH_TOKEN", "")
 
-def spf_excel_like_first_match(inv_df: pd.DataFrame, pn_norm: str, loc_val: str, inv_name_col: str | None):
-    if pn_norm == "":
-        return None
-    loc_clean = spf_clean_space(loc_val)
-    base = (inv_df["_LOC2_CLEAN"] == loc_clean) & (inv_df["_QTY_NUM"] > 0)
-    if inv_name_col:
-        m1 = inv_df["_TOK_NAME_SEMI"].str.contains(";" + pn_norm + ";", regex=False, na=False)
-        sub1 = inv_df.loc[base & m1]
-        if not sub1.empty:
-            return sub1.iloc[0]
-    m2 = inv_df["_TOK_PN_SEMI"].str.contains(";" + pn_norm + ";", regex=False, na=False)
-    sub2 = inv_df.loc[base & m2]
-    if not sub2.empty:
-        return sub2.iloc[0]
-    return None
-
-def spf_inv_text_from_row(row):
-    if row is None: return "No Stock"
-    loc  = str(row.get(SPF_INV_COL_LOC, "")).strip()
-    area = str(row.get(SPF_INV_COL_AREA, "")).strip()
-    qty  = row.get(SPF_INV_COL_QTY)
-    try:
-        q = int(float(qty))
-    except Exception:
-        q = qty
-    parts = []
-    if loc:  parts.append(loc)
-    if area: parts.append(area)
-    if q is not None and str(q) != "nan":
-        parts.append(f"Qty - {q}")
-    return "; ".join(parts) if parts else "No Stock"
-
-def spf_unpivot_to_task_then_parts(df_proc_filtered: pd.DataFrame) -> pd.DataFrame:
-    cols = list(df_proc_filtered.columns)
-    part_cols = [c for c in cols if any(c.startswith(pfx) for pfx in SPF_PART_PREFIXES)]
-
-    # Header rows
-    hdr = df_proc_filtered[[SPF_COL_TASKNO, SPF_COL_TASK]].drop_duplicates().copy()
-    hdr["Part Number"] = None
-    hdr["Part Type"]   = None
-    hdr["Qty"]         = None
-    hdr["RowKind"]     = "Task"
-    hdr["SfxKey"]      = 0
-
-    if not part_cols:
-        out = hdr.copy()
-        out["__TaskNum"] = pd.to_numeric(out[SPF_COL_TASKNO], errors="coerce").fillna(0)
-        out = out.sort_values(by=["__TaskNum", "RowKind", "SfxKey"]).drop(columns="__TaskNum")
-        return out[[SPF_COL_TASKNO, SPF_COL_TASK, "Part Number", "Part Type", "Qty"]].reset_index(drop=True)
-
-    long = df_proc_filtered.melt(
-        id_vars=[c for c in cols if c not in part_cols],
-        value_vars=part_cols, var_name="Attr", value_name="Val"
-    )
-    long["Kind"] = long["Attr"].str.extract(r"^(.*)_", expand=False)
-    long["Sfx"]  = long["Attr"].str.extract(r"_(.*)$",  expand=False)
-    long = long.drop(columns=["Attr"])
-
-    def first_non_null(x: pd.Series):
-        x = x.dropna()
-        return x.iloc[0] if not x.empty else None
-
-    idx_cols = [c for c in [SPF_COL_TASKNO, SPF_COL_TASK, SPF_COL_SERVICE, SPF_COL_SERIAL, "Sfx"] if c in long.columns]
-    wide = long.pivot_table(index=idx_cols, columns="Kind", values="Val",
-                            aggfunc=first_non_null).reset_index()
-
-    has_pt  = "Part Type" in wide.columns
-    has_dsc = "Description" in wide.columns
-    if has_pt and has_dsc:
-        wide["Part Type (Display)"] = wide["Part Type"].where(
-            wide["Part Type"].astype(str).str.strip().ne(""),
-            wide["Description"]
+    if not GH_OWNER or not GH_REPO or not GH_PATH:
+        st.error(
+            "Missing secrets. Please set GH_OWNER, GH_REPO, GH_WORKBOOK_PATH "
+            "(and GH_TOKEN if the repo is private) in Streamlit secrets."
         )
-    elif has_pt:
-        wide["Part Type (Display)"] = wide["Part Type"]
-    elif has_dsc:
-        wide["Part Type (Display)"] = wide["Description"]
-    else:
-        wide["Part Type (Display)"] = None
+        st.stop()
 
-    if "Qty" in wide.columns:
-        wide["Qty"] = pd.to_numeric(wide["Qty"], errors="coerce")
+    # ---------- Sheet / Column names ----------
+    SHEET_PROC     = "Service Procedures"
+    SHEET_CTRL     = "Controls"
+    SHEET_INV      = "Parts_Master"
+    SHEET_XREF     = "Filter_List"
 
-    sel_cols = [c for c in [SPF_COL_TASKNO, SPF_COL_TASK, "Part Number", "Part Type (Display)", "Qty", "Sfx"] if c in wide.columns]
-    parts = wide[sel_cols].rename(columns={"Part Type (Display)": "Part Type"}).copy()
-    parts["RowKind"] = "Part"
-    parts["SfxKey"]  = pd.to_numeric(parts.get("Sfx"), errors="coerce").fillna(9999).astype(int)
-    if "Sfx" in parts.columns:
-        parts.drop(columns=["Sfx"], inplace=True)
+    COL_ASSET    = "Asset"
+    COL_SERIAL   = "Serial"
+    COL_SERVICE  = "Service"
+    COL_TASKNO   = "Task #"
+    COL_TASK     = "Task"
+    COL_LOC_LIST = "Locations"
 
-    # Align and combine
-    final_cols = [SPF_COL_TASKNO, SPF_COL_TASK, "Part Number", "Part Type", "Qty", "RowKind", "SfxKey"]
+    INV_COL_PN    = "Part Numbers"
+    INV_COL_QTY   = "Quantity in Stock"
+    INV_COL_LOC   = "Location"
+    INV_COL_AREA  = "Area"
+    INV_COL_LOC2  = "Location2"
 
-    def coerce_cols(df: pd.DataFrame) -> pd.DataFrame:
-        df = df.loc[:, ~pd.Index(df.columns).duplicated(keep="first")]
-        for c in final_cols:
-            if c not in df.columns:
-                df[c] = None
-        return df[final_cols]
+    XREF_COL_CAT  = "Cat"
+    XREF_COL_DON  = "Donaldson P/N"
 
-    hdr   = coerce_cols(hdr)
-    parts = coerce_cols(parts)
+    PART_PREFIXES = ("Part Number_", "Part Type_", "Description_", "Qty_")
 
-    combined = pd.concat([hdr, parts], ignore_index=True, sort=False)
-    combined["__TaskNum"] = pd.to_numeric(combined[SPF_COL_TASKNO], errors="coerce").fillna(0)
-    combined["__rk"]      = combined["RowKind"].map({"Task": 0, "Part": 1}).fillna(1)
-    combined = combined.sort_values(by=["__TaskNum", "__rk", "SfxKey"]).drop(columns=["__TaskNum", "__rk"])
+    # Optional inventory name/description candidates (if present we’ll use them)
+    INV_NAME_CANDIDATES = [
+        "Name", "Description", "Item", "Part Name", "Description 1",
+        "Item Description", "Product Name"
+    ]
 
-    combined.loc[combined["RowKind"] == "Part", SPF_COL_TASKNO] = None
-    return combined[[SPF_COL_TASKNO, SPF_COL_TASK, "Part Number", "Part Type", "Qty"]].reset_index(drop=True)
+    # ---------- GitHub fetch ----------
+    def _gh_headers_json():
+        hdrs = {"Accept": "application/vnd.github+json"}
+        if GH_TOKEN:
+            hdrs["Authorization"] = f"Bearer {GH_TOKEN}"
+        return hdrs
 
+    @st.cache_data(ttl=120, show_spinner=False)
+    def fetch_workbook_bytes(owner: str, repo: str, branch: str, path: str) -> bytes:
+        url = f"https://api.github.com/repos/{owner}/{repo}/contents/{quote(path)}"
+        params = {"ref": branch}
+        r = requests.get(url, headers=_gh_headers_json(), params=params, timeout=30)
+        if r.status_code != 200:
+            raise RuntimeError(
+                f"GitHub error {r.status_code} fetching {owner}/{repo}:{path}@{branch}\n"
+                f"{r.text[:400]}"
+            )
+        data = r.json()
+        if isinstance(data, dict):
+            if "content" in data and data.get("encoding") == "base64":
+                try:
+                    return base64.b64decode(data["content"])
+                except Exception as e:
+                    raise RuntimeError(f"Failed to decode base64 content: {e}") from e
+            if "download_url" in data and data["download_url"]:
+                rr = requests.get(data["download_url"], timeout=60)
+                rr.raise_for_status()
+                return rr.content
+        raise RuntimeError(
+            f"Unexpected GitHub response for path '{path}'. "
+            f"Is it a file (not a folder)? Keys: {list(data)[:10]}"
+        )
+
+    def load_xls_from_bytes(b: bytes) -> pd.ExcelFile:
+        return pd.ExcelFile(io.BytesIO(b), engine="openpyxl")
+
+    def read_sheet(xls: pd.ExcelFile, sheet: str) -> pd.DataFrame:
+        df = pd.read_excel(xls, sheet_name=sheet)
+        return df.loc[:, ~pd.Index(df.columns).duplicated(keep="first")]
+
+    # ---------- Domain helpers ----------
+    def normalize_pn(pn):
+        """Uppercase, remove all non-alphanumerics (makes hyphens, spaces, dots irrelevant)."""
+        if pd.isna(pn): return ""
+        return "".join(ch for ch in str(pn).upper() if ch.isalnum())
+
+    _SPLIT_RE = re.compile(r"[,\;/\s]+")
+
+    def _token_norms_from_text(s: str):
+        """
+        Produce PN-like tokens from free text by splitting on comma/semicolon/slash/space,
+        then normalizing each token (hyphens/spaces removed), keeping only tokens that contain a digit.
+        """
+        if s is None: return []
+        toks = []
+        for piece in _SPLIT_RE.split(str(s).upper()):
+            piece = piece.strip()
+            if not piece:
+                continue
+            n = normalize_pn(piece)
+            if n and any(ch.isdigit() for ch in n):
+                toks.append(n)
+        return toks
+
+    def _semi_join(tokens):
+        # Build ;T1;T2; string for exact token membership checks (Excel-like)
+        uniq, seen = [], set()
+        for t in tokens:
+            if t not in seen:
+                uniq.append(t); seen.add(t)
+        return ";" + ";".join(uniq) + ";" if uniq else ";"
+
+    # ---------- Load workbook ----------
+    try:
+        wb_bytes = fetch_workbook_bytes(GH_OWNER, GH_REPO, GH_BRANCH, GH_PATH)
+        xls = load_xls_from_bytes(wb_bytes)
+        df_proc = read_sheet(xls, SHEET_PROC)
+        df_ctrl = read_sheet(xls, SHEET_CTRL)
+        df_inv  = read_sheet(xls, SHEET_INV)
+        df_xref = read_sheet(xls, SHEET_XREF) if SHEET_XREF in xls.sheet_names else pd.DataFrame()
+    except Exception as e:
+        st.error(f"Error loading workbook from GitHub: {e}")
+        st.stop()
+
+    with st.sidebar:
+        st.caption(f"Workbook source: {GH_OWNER}/{GH_REPO}@{GH_BRANCH} • {GH_PATH}")
+        if st.button("Reload GitHub workbook"):
+            st.cache_data.clear()
+            st.rerun()
+
+    # ---------- Validate columns ----------
+    need_proc = {COL_SERIAL, COL_SERVICE, COL_TASKNO, COL_TASK}
+    need_ctrl = {COL_ASSET, COL_SERIAL, COL_LOC_LIST}
+    need_inv  = {INV_COL_PN, INV_COL_QTY, INV_COL_LOC, INV_COL_AREA, INV_COL_LOC2}
+    errors = []
+    if not need_proc.issubset(df_proc.columns): errors.append("Service Procedures missing required columns.")
+    if not need_ctrl.issubset(df_ctrl.columns): errors.append("Controls missing Asset/Serial/Locations.")
+    if not need_inv.issubset(df_inv.columns):   errors.append("Parts_Master missing {Part Numbers, Quantity in Stock, Location, Area, Location2}.")
+    if errors:
+        st.error(" ".join(errors))
+        st.stop()
+
+    # ---------- Precompute inventory (Name-first, then Part Numbers) ----------
+    df_inv = df_inv.copy()
+
+    inv_name_col = next((c for c in INV_NAME_CANDIDATES if c in df_inv.columns), None)
+
+    def _clean_space(s):
+        if s is None:
+            return ""
+        # remove NBSPs/tabs and trim
+        return str(s).replace("\u00A0", "").replace("\t", "").strip()
+
+    def _build_tok_name(row) -> str:
+        if not inv_name_col:
+            return ";"
+        toks = _token_norms_from_text(row.get(inv_name_col, ""))
+        return _semi_join(toks)
+
+    def _build_tok_pn(row) -> str:
+        toks = _token_norms_from_text(row.get(INV_COL_PN, ""))
+        return _semi_join(toks)
+
+    # exact-token membership strings
+    df_inv["_TOK_NAME_SEMI"] = df_inv.apply(_build_tok_name, axis=1) if inv_name_col else ";"
+    df_inv["_TOK_PN_SEMI"]   = df_inv.apply(_build_tok_pn,   axis=1)
+
+    # cleaned location + numeric qty
+    df_inv["_LOC2_CLEAN"] = df_inv[INV_COL_LOC2].map(_clean_space)
+    df_inv["_QTY_NUM"]    = pd.to_numeric(df_inv[INV_COL_QTY], errors="coerce").fillna(0)
+
+    def excel_like_first_match(inv_df: pd.DataFrame, pn_norm: str, loc_val: str):
+        """
+        Prefer a token match in Name (if present), else fall back to Part Numbers.
+        Matching is exact-token against prebuilt ;T1;T2; strings.
+        """
+        if pn_norm == "":
+            return None
+
+        loc_clean = _clean_space(loc_val)
+        base = (inv_df["_LOC2_CLEAN"] == loc_clean) & (inv_df["_QTY_NUM"] > 0)
+
+        # 1) Name-first match
+        if "_TOK_NAME_SEMI" in inv_df.columns:
+            m1 = inv_df["_TOK_NAME_SEMI"].str.contains(";" + pn_norm + ";", regex=False, na=False)
+            sub1 = inv_df.loc[base & m1]
+            if not sub1.empty:
+                return sub1.iloc[0]
+
+        # 2) Fallback: Part Numbers list
+        m2 = inv_df["_TOK_PN_SEMI"].str.contains(";" + pn_norm + ";", regex=False, na=False)
+        sub2 = inv_df.loc[base & m2]
+        if not sub2.empty:
+            return sub2.iloc[0]
+
+        return None
+
+    def inv_text_from_row(row):
+        if row is None:
+            return "No Stock"
+        loc  = str(row.get(INV_COL_LOC, "")).strip()
+        area = str(row.get(INV_COL_AREA, "")).strip()
+        qty  = row.get(INV_COL_QTY)
+        try:
+            q = int(float(qty))
+        except Exception:
+            q = qty
+        parts = []
+        if loc:  parts.append(loc)
+        if area: parts.append(area)
+        if q is not None and str(q) != "nan":
+            parts.append(f"Qty - {q}")
+        return "; ".join(parts) if parts else "No Stock"
+
+    # ---------- Unpivot service procedures to Task/Part rows ----------
+    def unpivot_to_task_then_parts(df_proc_filtered: pd.DataFrame) -> pd.DataFrame:
+        cols = list(df_proc_filtered.columns)
+        part_cols = [c for c in cols if c.startswith(PART_PREFIXES)]
+
+        # Header rows
+        hdr = df_proc_filtered[[COL_TASKNO, COL_TASK]].drop_duplicates().copy()
+        hdr["Part Number"] = None
+        hdr["Part Type"]   = None
+        hdr["Qty"]         = None
+        hdr["RowKind"]     = "Task"
+        hdr["SfxKey"]      = 0
+
+        if not part_cols:
+            out = hdr.copy()
+            out["__TaskNum"] = pd.to_numeric(out[COL_TASKNO], errors="coerce").fillna(0)
+            out = out.sort_values(by=["__TaskNum", "RowKind", "SfxKey"]).drop(columns="__TaskNum")
+            return out[[COL_TASKNO, COL_TASK, "Part Number", "Part Type", "Qty"]].reset_index(drop=True)
+
+        long = df_proc_filtered.melt(
+            id_vars=[c for c in cols if c not in part_cols],
+            value_vars=part_cols, var_name="Attr", value_name="Val"
+        )
+        long["Kind"] = long["Attr"].str.extract(r"^(.*)_", expand=False)
+        long["Sfx"]  = long["Attr"].str.extract(r"_(.*)$",  expand=False)
+        long = long.drop(columns=["Attr"])
+
+        def first_non_null(x: pd.Series):
+            x = x.dropna()
+            return x.iloc[0] if not x.empty else None
+
+        idx_cols = [c for c in [COL_TASKNO, COL_TASK, COL_SERVICE, COL_SERIAL, "Sfx"] if c in long.columns]
+        wide = long.pivot_table(index=idx_cols, columns="Kind", values="Val",
+                                aggfunc=first_non_null).reset_index()
+
+        has_pt  = "Part Type" in wide.columns
+        has_dsc = "Description" in wide.columns
+        if has_pt and has_dsc:
+            wide["Part Type (Display)"] = wide["Part Type"].where(
+                wide["Part Type"].astype(str).str.strip().ne(""),
+                wide["Description"]
+            )
+        elif has_pt:
+            wide["Part Type (Display)"] = wide["Part Type"]
+        elif has_dsc:
+            wide["Part Type (Display)"] = wide["Description"]
+        else:
+            wide["Part Type (Display)"] = None
+
+        if "Qty" in wide.columns:
+            wide["Qty"] = pd.to_numeric(wide["Qty"], errors="coerce")
+
+        sel_cols = [c for c in [COL_TASKNO, COL_TASK, "Part Number", "Part Type (Display)", "Qty", "Sfx"] if c in wide.columns]
+        parts = wide[sel_cols].rename(columns={"Part Type (Display)": "Part Type"}).copy()
+        parts["RowKind"] = "Part"
+        parts["SfxKey"]  = pd.to_numeric(parts.get("Sfx"), errors="coerce").fillna(9999).astype(int)
+        if "Sfx" in parts.columns:
+            parts.drop(columns=["Sfx"], inplace=True)
+
+        # Align and combine
+        final_cols = [COL_TASKNO, COL_TASK, "Part Number", "Part Type", "Qty", "RowKind", "SfxKey"]
+
+        def coerce_cols(df: pd.DataFrame) -> pd.DataFrame:
+            df = df.loc[:, ~pd.Index(df.columns).duplicated(keep="first")]
+            for c in final_cols:
+                if c not in df.columns:
+                    df[c] = None
+            return df[final_cols]
+
+        hdr   = coerce_cols(hdr)
+        parts = coerce_cols(parts)
+
+        combined = pd.concat([hdr, parts], ignore_index=True, sort=False)
+        combined["__TaskNum"] = pd.to_numeric(combined[COL_TASKNO], errors="coerce").fillna(0)
+        combined["__rk"]      = combined["RowKind"].map({"Task": 0, "Part": 1}).fillna(1)
+        combined = combined.sort_values(by=["__TaskNum", "__rk", "SfxKey"]).drop(columns=["__TaskNum", "__rk"])
+
+        combined.loc[combined["RowKind"] == "Part", COL_TASKNO] = None
+        return combined[[COL_TASKNO, COL_TASK, "Part Number", "Part Type", "Qty"]].reset_index(drop=True)
+
+    def _repeat_header(row):
+        tr = row._tr
+        trPr = tr.get_or_add_trPr()
+        tblHeader = OxmlElement('w:tblHeader')
+        trPr.append(tblHeader)
+
+    def to_docx_bytes_sp(df: pd.DataFrame, *, asset: str, serial: str, service: str, location: str) -> bytes:
+        doc = Document()
+        section = doc.sections[0]
+        section.orientation = WD_ORIENT.LANDSCAPE
+        section.page_width, section.page_height = section.page_height, section.page_width
+        for side in ("left_margin", "right_margin", "top_margin", "bottom_margin"):
+            setattr(section, side, Inches(0.5))
+
+        doc.styles['Normal'].font.name = "Calibri"
+        doc.styles['Normal'].font.size = Pt(10)
+
+        title = doc.add_paragraph()
+        run = title.add_run(
+            f"Service Procedure Filter — Asset: {asset}  (Serial: {serial})  |  Service: {service}  |  Location: {location}"
+        )
+        run.bold = True
+        doc.add_paragraph("")
+
+        cols = list(df.columns)
+        table = doc.add_table(rows=1, cols=len(cols))
+        table.autofit = True
+        hdr_cells = table.rows[0].cells
+        for i, c in enumerate(cols):
+            p = hdr_cells[i].paragraphs[0]
+            r = p.add_run(str(c)); r.bold = True
+            tcPr = hdr_cells[i]._tc.get_or_add_tcPr()
+            shd = OxmlElement('w:shd'); shd.set(qn('w:fill'), "DDDDDD"); tcPr.append(shd)
+        _repeat_header(table.rows[0])
+
+        for _, row in df.iterrows():
+            cells = table.add_row().cells
+            for i, c in enumerate(cols):
+                val = row.get(c, "")
+                cells[i].text = "" if pd.isna(val) else str(val)
+
+        width_map = {
+            "Task #": 0.6, "Task": 1.8,
+            "Part Number": 1.1, "Part Type": 1.9, "Qty": 0.6,
+            "InStk": 1.5, "Donaldson Interchange": 1.3, "In Stock": 1.5,
+        }
+        for i, c in enumerate(cols):
+            w = width_map.get(c)
+            if w:
+                for cell in [r.cells[i] for r in table.rows]:
+                    cell.width = Inches(w)
+
+        out = io.BytesIO(); doc.save(out); out.seek(0)
+        return out.read()
+
+    # ---------- Controls ----------
+    assets    = sorted(df_ctrl[COL_ASSET].dropna().astype(str).unique().tolist())
+    services  = sorted(df_proc[COL_SERVICE].dropna().astype(str).unique().tolist())
+    locations = sorted(df_ctrl[COL_LOC_LIST].dropna().astype(str).unique().tolist())
+
+    sel_asset   = st.selectbox("Asset", options=assets, index=0 if assets else None)
+    sel_service = st.selectbox("Service", options=services, index=0 if services else None)
+    sel_loc     = st.selectbox("Location (Controls[Locations] → Parts_Master[Location2])", options=locations, index=0 if locations else None)
+
+    # ---------- Run ----------
+    if st.button("Run Filter"):
+        if not assets or not services or not locations:
+            st.warning("Workbook appears to be missing required values.")
+            st.stop()
+
+        row = df_ctrl.loc[df_ctrl[COL_ASSET].astype(str) == str(sel_asset)]
+        if row.empty:
+            st.warning(f"No Serial in Controls for asset: {sel_asset}")
+            st.stop()
+        serial = str(row.iloc[0][COL_SERIAL])
+
+        mask = (
+            df_proc[COL_SERIAL].astype(str).str.upper().eq(serial.upper()) &
+            df_proc[COL_SERVICE].astype(str).str.upper().eq(sel_service.upper())
+        )
+        proc_filt = df_proc.loc[mask].copy()
+        if proc_filt.empty:
+            st.warning(f"No rows for Serial {serial} / Service {sel_service}.")
+            st.stop()
+
+        result = unpivot_to_task_then_parts(proc_filt)
+        result["_PN_NORM"] = result["Part Number"].apply(normalize_pn)
+
+        # ---- CAT → Donaldson cross reference ----
+        if not df_xref.empty and {XREF_COL_CAT, XREF_COL_DON}.issubset(df_xref.columns):
+            xref = df_xref.copy()
+            xref["_CAT_NORM"] = xref[XREF_COL_CAT].apply(normalize_pn)
+            xref["_DON_RAW"]  = xref[XREF_COL_DON].astype(str)
+            result = result.merge(
+                xref[["_CAT_NORM", "_DON_RAW"]].drop_duplicates("_CAT_NORM"),
+                how="left", left_on="_PN_NORM", right_on="_CAT_NORM"
+            )
+            def map_don(row_):
+                if row_["_PN_NORM"] == "":
+                    return ""
+                val = row_.get("_DON_RAW")
+                if pd.isna(val) or str(val).strip() == "":
+                    return "No Interchange"
+                return str(val)
+            result["Donaldson Interchange"] = result.apply(map_don, axis=1)
+            result.drop(columns=["_CAT_NORM", "_DON_RAW"], inplace=True, errors="ignore")
+        else:
+            result["Donaldson Interchange"] = ""
+
+        # ---- Inventory lookups (Name-first, then Part Numbers; token-based) ----
+        def compute_instk(pn_norm: str) -> str:
+            if pn_norm == "":
+                return ""
+            hit = excel_like_first_match(df_inv, pn_norm, sel_loc)
+            return inv_text_from_row(hit)
+
+        result["InStk"] = result["_PN_NORM"].apply(compute_instk)
+
+        def compute_instock(di: str) -> str:
+            if not di or di.strip() == "" or di.strip().upper() == "NO INTERCHANGE":
+                return ""
+            di_norm = normalize_pn(di)
+            hit = excel_like_first_match(df_inv, di_norm, sel_loc)
+            return inv_text_from_row(hit)
+
+        result["In Stock"] = result["Donaldson Interchange"].apply(compute_instock)
+        result.drop(columns=["_PN_NORM"], inplace=True, errors="ignore")
+
+        base_cols = [COL_TASKNO, COL_TASK, "Part Number", "Part Type", "Qty",
+                    "InStk", "Donaldson Interchange", "In Stock"]
+        ordered = [c for c in base_cols if c in result.columns] + [c for c in result.columns if c not in base_cols]
+
+        st.subheader("Filtered Result")
+        st.dataframe(result[ordered], use_container_width=True)
+
+        # Downloads
+        def to_excel_bytes(df: pd.DataFrame) -> bytes:
+            bio = io.BytesIO()
+            with pd.ExcelWriter(bio, engine="xlsxwriter") as w:
+                df.to_excel(w, index=False, sheet_name="Filtered")
+            bio.seek(0)
+            return bio.getvalue()
+
+        csv_bytes  = result[ordered].to_csv(index=False).encode("utf-8")
+        xlsx_bytes = to_excel_bytes(result[ordered])
+
+        if DOCX_AVAILABLE:
+            docx_bytes = to_docx_bytes_sp(
+                result[ordered],
+                asset=sel_asset, serial=serial, service=sel_service, location=sel_loc
+            )
+
+        cols = 4 if (DOCX_AVAILABLE and SHOW_PRINT) else (3 if DOCX_AVAILABLE else 2)
+        c = st.columns(cols)
+        with c[0]:
+            st.download_button("⬇️ CSV", data=csv_bytes,
+                            file_name=f"Filtered_{sel_asset}_{sel_service.replace(' ','_')}.csv",
+                            mime="text/csv")
+        with c[1]:
+            st.download_button("⬇️ Excel", data=xlsx_bytes,
+                            file_name=f"Filtered_{sel_asset}_{sel_service.replace(' ','_')}.xlsx",
+                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        if DOCX_AVAILABLE:
+            with c[2]:
+                st.download_button("⬇️ Word", data=docx_bytes,
+                                file_name=f"Filtered_{sel_asset}_{sel_service.replace(' ','_')}.docx",
+                                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+            if SHOW_PRINT:
+                with c[3]:
+                    if st.button("🖨️ Print Word (default printer)"):
+                        # Print via temporary file on Windows
+                        try:
+                            tmp_dir = tempfile.gettempdir()
+                            tmp_path = os.path.join(tmp_dir, f"SPF_{int(time.time())}_Filtered.docx")
+                            with open(tmp_path, "wb") as f:
+                                f.write(docx_bytes)
+                            os.startfile(tmp_path, "print")  # type: ignore[attr-defined]
+                            st.success(f"Sent to default printer: {os.path.basename(tmp_path)}")
+                        except Exception as e:
+                            st.error(f"Print failed: {e}")
+
+        st.caption("Task # shows only on header rows. Inventory uses Parts_Master filtered by Location2 = selected Location.")
 
 # ---------- App ----------
 st.sidebar.caption(f"SPF Work Orders — v{APP_VERSION}")
@@ -1078,7 +1360,7 @@ else:
 
     page = st.sidebar.radio(
         "Page",
-        ["🔎 Asset History", "📋 Work Orders", "🔁 Cross Reference", "🧰 Service Procedure Filter", "🧾 Service Report", "📚 Service History"],
+        ["🔎 Asset History", "📋 Work Orders", "🔁 Cross Reference", "🧾 Service Report", "📚 Service History", "🧰 Service Procedure Filter"],
         index=1
     )
 
@@ -1362,135 +1644,6 @@ else:
                 st.dataframe(hits, use_container_width=True)
         st.stop()
 
-    # ========= Service Procedure Filter =========
-    if page == "🧰 Service Procedure Filter":
-        st.markdown("### Service Procedure Filter (local workbook)")
-
-        # Load all SPF sheets from SAME local Workorders.xlsx
-        df_proc, df_ctrl, df_inv, df_xref = spf_load_all(xmtime, str(xlsx_path))
-
-        # Validate
-        errors = []
-        if df_proc is None or df_proc.empty or not {SPF_COL_SERIAL, SPF_COL_SERVICE, SPF_COL_TASKNO, SPF_COL_TASK}.issubset(df_proc.columns):
-            errors.append("Service Procedures sheet missing required columns.")
-        if df_ctrl is None or df_ctrl.empty or not {SPF_COL_ASSET, SPF_COL_SERIAL, SPF_COL_LOC_LIST}.issubset(df_ctrl.columns):
-            errors.append("Controls sheet missing Asset/Serial/Locations.")
-        if df_inv is None or df_inv.empty or not {SPF_INV_COL_PN, SPF_INV_COL_QTY, SPF_INV_COL_LOC, SPF_INV_COL_AREA, SPF_INV_COL_LOC2}.issubset(df_inv.columns):
-            errors.append("Parts_Master sheet missing {Part Numbers, Quantity in Stock, Location, Area, Location2}.")
-        if errors:
-            for e in errors: st.error(e)
-            st.stop()
-
-        # Prepare inventory
-        df_inv_pre, inv_name_col = spf_prepare_inventory(df_inv)
-
-        # Controls
-        assets    = sorted(df_ctrl[SPF_COL_ASSET].dropna().astype(str).unique().tolist())
-        services  = sorted(df_proc[SPF_COL_SERVICE].dropna().astype(str).unique().tolist())
-        locations = sorted(df_ctrl[SPF_COL_LOC_LIST].dropna().astype(str).unique().tolist())
-
-        c1, c2, c3 = st.columns([2,2,2])
-        with c1:
-            sel_asset   = st.selectbox("Asset", options=assets, index=0 if assets else None)
-        with c2:
-            sel_service = st.selectbox("Service", options=services, index=0 if services else None)
-        with c3:
-            sel_loc     = st.selectbox("Location (Controls[Locations] → Parts_Master[Location2])", options=locations, index=0 if locations else None)
-
-        # Run
-        if st.button("Run Filter"):
-            row = df_ctrl.loc[df_ctrl[SPF_COL_ASSET].astype(str) == str(sel_asset)]
-            if row.empty:
-                st.warning(f"No Serial in Controls for asset: {sel_asset}")
-                st.stop()
-            serial = str(row.iloc[0][SPF_COL_SERIAL])
-
-            mask = (
-                df_proc[SPF_COL_SERIAL].astype(str).str.upper().eq(serial.upper()) &
-                df_proc[SPF_COL_SERVICE].astype(str).str.upper().eq(str(sel_service).upper())
-            )
-            proc_filt = df_proc.loc[mask].copy()
-            if proc_filt.empty:
-                st.warning(f"No rows for Serial {serial} / Service {sel_service}.")
-                st.stop()
-
-            result = spf_unpivot_to_task_then_parts(proc_filt)
-            result["_PN_NORM"] = result["Part Number"].apply(spf_normalize_pn)
-
-            # CAT → Donaldson cross reference (optional)
-            if (df_xref is not None) and (not df_xref.empty) and {SPF_XREF_COL_CAT, SPF_XREF_COL_DON}.issubset(df_xref.columns):
-                xref = df_xref.copy()
-                xref["_CAT_NORM"] = xref[SPF_XREF_COL_CAT].apply(spf_normalize_pn)
-                xref["_DON_RAW"]  = xref[SPF_XREF_COL_DON].astype(str)
-                result = result.merge(
-                    xref[["_CAT_NORM", "_DON_RAW"]].drop_duplicates("_CAT_NORM"),
-                    how="left", left_on="_PN_NORM", right_on="_CAT_NORM"
-                )
-                def map_don(row_):
-                    if row_["_PN_NORM"] == "":
-                        return ""
-                    val = row_.get("_DON_RAW")
-                    if pd.isna(val) or str(val).strip() == "":
-                        return "No Interchange"
-                    return str(val)
-                result["Donaldson Interchange"] = result.apply(map_don, axis=1)
-                result.drop(columns=["_CAT_NORM", "_DON_RAW"], inplace=True, errors="ignore")
-            else:
-                result["Donaldson Interchange"] = ""
-
-            # Inventory lookups (Name-first, then Part Numbers; token-based)
-            def compute_instk(pn_norm: str) -> str:
-                if pn_norm == "":
-                    return ""
-                hit = spf_excel_like_first_match(df_inv_pre, pn_norm, sel_loc, inv_name_col)
-                return spf_inv_text_from_row(hit)
-
-            result["InStk"] = result["_PN_NORM"].apply(compute_instk)
-
-            def compute_instock(di: str) -> str:
-                if not di or di.strip() == "" or di.strip().upper() == "NO INTERCHANGE":
-                    return ""
-                di_norm = spf_normalize_pn(di)
-                hit = spf_excel_like_first_match(df_inv_pre, di_norm, sel_loc, inv_name_col)
-                return spf_inv_text_from_row(hit)
-
-            result["In Stock"] = result["Donaldson Interchange"].apply(compute_instock)
-            result.drop(columns=["_PN_NORM"], inplace=True, errors="ignore")
-
-            base_cols = [SPF_COL_TASKNO, SPF_COL_TASK, "Part Number", "Part Type", "Qty",
-                         "InStk", "Donaldson Interchange", "In Stock"]
-            ordered = [c for c in base_cols if c in result.columns] + [c for c in result.columns if c not in base_cols]
-
-            st.subheader("Filtered Result")
-            st.dataframe(result[ordered], use_container_width=True)
-
-            # Downloads
-            csv_bytes  = result[ordered].to_csv(index=False).encode("utf-8")
-            xlsx_bytes = to_xlsx_bytes(result[ordered], sheet="Filtered")
-            try:
-                docx_bytes = to_docx_bytes(result[ordered], title=f"Service Procedure Filter — Asset: {sel_asset} (Serial: {serial}) | Service: {sel_service} | Location: {sel_loc}")
-            except Exception:
-                docx_bytes = None
-
-            cols = 3 if docx_bytes else 2
-            c = st.columns(cols)
-            with c[0]:
-                st.download_button("⬇️ CSV", data=csv_bytes,
-                                   file_name=f"Filtered_{sel_asset}_{str(sel_service).replace(' ','_')}.csv",
-                                   mime="text/csv")
-            with c[1]:
-                st.download_button("⬇️ Excel", data=xlsx_bytes,
-                                   file_name=f"Filtered_{sel_asset}_{str(sel_service).replace(' ','_')}.xlsx",
-                                   mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-            if docx_bytes:
-                with c[2]:
-                    st.download_button("⬇️ Word", data=docx_bytes,
-                                       file_name=f"Filtered_{sel_asset}_{str(sel_service).replace(' ','_')}.docx",
-                                       mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
-
-            st.caption("Task # shows only on header rows. Inventory uses Parts_Master filtered by Location2 = selected Location.")
-        st.stop()
-
     # ========= Service Report =========
     if page == "🧾 Service Report":
         st.markdown("### Service Report")
@@ -1706,3 +1859,9 @@ else:
                 mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
             )
         st.stop()
+
+    # ========= Service Procedure Filter =========
+    if page == "🧰 Service Procedure Filter":
+        render_service_procedure_page()
+        st.stop()
+
