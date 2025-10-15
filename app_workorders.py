@@ -230,6 +230,25 @@ def _load_xref_bytes(cfg: dict) -> bytes:
     return p.read_bytes()
 
 
+# --- Cross-Reference (local file) ---
+XREF_LOCAL_DEFAULT = "Parts crossreference.xlsm"  # falls back to .xlsx if needed
+
+def _xref_path_from_cfg(cfg: dict) -> Path:
+    # lets you override via app_config.yaml -> settings.xref_path
+    return Path((cfg.get("settings", {}) or {}).get("xref_path") or XREF_LOCAL_DEFAULT)
+
+@st.cache_data(ttl=180, show_spinner=False)
+def _load_xref_bytes(cfg: dict) -> bytes:
+    p = _xref_path_from_cfg(cfg)
+    if not p.exists():
+        alt = p.with_suffix(".xlsx")
+        if alt.exists():
+            p = alt
+        else:
+            raise FileNotFoundError(f"Cross-reference workbook not found: {p.resolve()}")
+    return p.read_bytes()
+
+
 # ---------- fast I/O / Parquet layer ----------
 PARQUET_DIR = Path("faststore")
 PARQUET_DIR.mkdir(exist_ok=True)
