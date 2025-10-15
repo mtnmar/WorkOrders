@@ -1342,7 +1342,5 @@ else:
                 with c[2]:
                     st.download_button("⬇️ Word", data=docx_bytes,
                                        file_name=f"Filtered_{sel_asset}_{sel_service.replace(' ','_')}.docx",
-                      
-
-
-
+                                       mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+        st.stop()
