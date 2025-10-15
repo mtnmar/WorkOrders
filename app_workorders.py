@@ -860,11 +860,11 @@ else:
         st.cache_data.clear()
         st.rerun()
 
-   page = st.sidebar.radio(
-    "Page",
-    ["🔎 Asset History", "📋 Work Orders", "🧾 Service Report", "📚 Service History", "🔁 Cross Reference"],
-    index=1
-)
+      page = st.sidebar.radio(
+        "Page",
+        ["🔎 Asset History", "📋 Work Orders", "🧾 Service Report", "📚 Service History", "🔁 Cross Reference"],
+        index=1
+    )
 
 
 
@@ -1088,9 +1088,8 @@ else:
                                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
         st.stop()
 
-
-# ========= Cross Reference =========
-if page == "🔁 Cross Reference":
+    # ========= Cross Reference =========
+    if page == "🔁 Cross Reference":
     st.markdown("### Cross-Reference Finder")
 
     xref_debug = st.sidebar.checkbox("XRef: show detected headers", value=False)
@@ -1150,7 +1149,6 @@ if page == "🔁 Cross Reference":
             st.dataframe(hits, use_container_width=True)
 
     st.stop()
-
 
     # ========= Service Report =========
     if page == "🧾 Service Report":
