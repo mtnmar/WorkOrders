@@ -211,6 +211,386 @@ def coerce_bool(s: pd.Series) -> pd.Series:
     out = m.map(lambda x: True if x in true_vals else (False if x in false_vals else False))
     return out.astype(bool)
 
+# --- Cross-Reference (local file) ---
+XREF_LOCAL_DEFAULT = "Parts crossreference.xlsm"  # falls back to .xlsx if needed
+
+def _xref_path_from_cfg(cfg: dict) -> Path:
+    # lets you override via app_config.yaml -> settings.xref_path
+    return Path((cfg.get("settings", {}) or {}).get("xref_path") or XREF_LOCAL_DEFAULT)
+
+@st.cache_data(ttl=180, show_spinner=False)
+def _load_xref_bytes(cfg: dict) -> bytes:
+    p = _xref_path_from_cfg(cfg)
+    if not p.exists():
+        alt = p.with_suffix(".xlsx")
+        if alt.exists():
+            p = alt
+        else:
+            raise FileNotFoundError(f"Cross-reference workbook not found: {p.resolve()}")
+    return p.read_bytes()
+
+# --- Cross-Reference (local) — constants & helpers (no GitHub) ---
+XREF_SHEET_INV   = "Parts_Master"
+XREF_SHEET_MERGE = "Merge"
+
+# Canonical inventory columns
+XREF_INV_COL_PN    = "Part Numbers"
+XREF_INV_COL_QTY   = "Quantity in Stock"
+XREF_INV_COL_LOC2  = "Location2"
+XREF_INV_COL_LOC   = "Location"
+XREF_INV_COL_AREA  = "Area"
+XREF_INV_COL_NAME  = "INV_NAME"  # standardized Name/Description
+
+XREF_NAME_CANDIDATES = [
+    "Name", "Description", "Item", "Part Name", "Description 1",
+    "Item Description", "Product Name"
+]
+
+# Optional: prioritize brands when the same token appears under multiple columns
+XREF_BRAND_PRIORITY = ["Caterpillar", "Donaldson", "Fleetguard", "Baldwin", "Wix", "Fram"]
+
+# ----- normalization helpers -----
+_XREF_NBSP = "\u00A0"
+
+def xref_normalize_pn(pn) -> str:
+    if pd.isna(pn): return ""
+    s = str(pn).upper().replace(_XREF_NBSP, " ")
+    return "".join(ch for ch in s if ch.isalnum())
+
+def xref_last_token_with_digits(s: str) -> str:
+    if not isinstance(s, str): s = str(s)
+    tokens = re.findall(r"[A-Za-z0-9]+", s.upper())
+    tokens = [t for t in tokens if any(ch.isdigit() for ch in t)]
+    return tokens[-1] if tokens else ""
+
+def xref_digits_only(s: str) -> str:
+    return "".join(ch for ch in str(s) if ch.isdigit())
+
+def xref_norm_text(s: str) -> str:
+    if s is None: return ""
+    s = str(s).upper().strip().replace(_XREF_NBSP, " ")
+    s = re.sub(r"[^A-Z0-9 ]+", " ", s)
+    s = re.sub(r"\s+", " ", s)
+    return s
+
+# ----- Excel open (supports .xlsm/.xlsx) -----
+def xref_excel_from_bytes(b: bytes) -> pd.ExcelFile:
+    return pd.ExcelFile(io.BytesIO(b), engine="openpyxl")
+
+# ----- Inventory sheet loader -----
+def xref_find_header_row_for_inventory(df_raw: pd.DataFrame):
+    candidates = {"part numbers","quantity in stock","location2","location","area","qty","on hand","name","description"}
+    for i in range(min(50, len(df_raw))):
+        vals = [str(v).strip().lower() for v in df_raw.iloc[i].tolist()]
+        if sum(v in candidates for v in vals) >= 2:
+            headers, seen = [], {}
+            for v in df_raw.iloc[i].tolist():
+                name = str(v).strip() or "Unnamed"
+                if name in seen:
+                    seen[name]+=1; name=f"{name}.{seen[name]}"
+                else:
+                    seen[name]=0
+                headers.append(name)
+            return i, headers
+    return None, None
+
+def xref_finalize_inventory_dataframe(df_raw: pd.DataFrame) -> pd.DataFrame:
+    header_idx, header_vals = xref_find_header_row_for_inventory(df_raw)
+    if header_idx is None:
+        df = df_raw.copy()
+        df.columns = [str(c).strip() for c in df.iloc[0].tolist()]
+        df = df.iloc[1:].reset_index(drop=True)
+    else:
+        df = df_raw.iloc[header_idx+1:].copy()
+        df.columns = [str(c).strip() for c in header_vals]
+        df = df.reset_index(drop=True)
+
+    cols_clean = pd.Index(df.columns).astype(str).str.strip()
+    df = df.loc[:, ~(cols_clean == "")]
+
+    # rename to canonical
+    rename_map = {}
+    for col in df.columns:
+        key = str(col).strip().lower()
+        if key in {"part numbers","part number","pn"}: rename_map[col]=XREF_INV_COL_PN
+        elif key in {"location2","location 2","loc2"}: rename_map[col]=XREF_INV_COL_LOC2
+        elif key in {"quantity in stock","qty in stock","quantity","qty","on hand","qoh"}: rename_map[col]=XREF_INV_COL_QTY
+        elif key in {"location","loc"}: rename_map[col]=XREF_INV_COL_LOC
+        elif key == "area": rename_map[col]=XREF_INV_COL_AREA
+    df = df.rename(columns=rename_map)
+
+    if XREF_INV_COL_QTY in df.columns:
+        df[XREF_INV_COL_QTY] = pd.to_numeric(df[XREF_INV_COL_QTY], errors="coerce").fillna(0)
+    for c in df.columns:
+        if df[c].dtype == object:
+            df[c] = df[c].astype(str).str.strip()
+
+    # Name/Description -> INV_NAME
+    name_col = next((c for c in XREF_NAME_CANDIDATES if c in df.columns), None)
+    df[XREF_INV_COL_NAME] = df[name_col].astype(str) if name_col else ""
+
+    # Normalized keys for matching
+    if XREF_INV_COL_PN in df.columns:
+        df["_PN_NORM"] = df[XREF_INV_COL_PN].map(xref_normalize_pn)
+        df["_PN_TAIL"] = df[XREF_INV_COL_PN].map(xref_last_token_with_digits).map(xref_normalize_pn)
+        df["_PN_DIG"]  = df[XREF_INV_COL_PN].map(xref_digits_only)
+    else:
+        df["_PN_NORM"]=df["_PN_TAIL"]=df["_PN_DIG"]=""
+
+    df["_NAME_NORM"] = df[XREF_INV_COL_NAME].map(xref_normalize_pn)
+    df["_NAME_TAIL"] = df[XREF_INV_COL_NAME].map(xref_last_token_with_digits).map(xref_normalize_pn)
+    df["_NAME_DIG"]  = df[XREF_INV_COL_NAME].map(xref_digits_only)
+
+    # Stable row id (so per-row aggregation preserves location dupes)
+    df["_ROWID"] = range(len(df))
+
+    def stock_text(row) -> str:
+        parts=[]
+        if XREF_INV_COL_LOC2 in row and str(row[XREF_INV_COL_LOC2]).strip(): parts.append(str(row[XREF_INV_COL_LOC2]).strip())
+        if XREF_INV_COL_LOC  in row and str(row[XREF_INV_COL_LOC]).strip():  parts.append(str(row[XREF_INV_COL_LOC]).strip())
+        if XREF_INV_COL_AREA in row and str(row[XREF_INV_COL_AREA]).strip(): parts.append(str(row[XREF_INV_COL_AREA]).strip())
+        if XREF_INV_COL_QTY  in row and str(row[XREF_INV_COL_QTY]).strip()!="":
+            try: q = int(float(row[XREF_INV_COL_QTY]))
+            except Exception: q = row[XREF_INV_COL_QTY]
+            parts.append(f"Qty - {q}")
+        return "; ".join(parts) if parts else ""
+    df["_STOCK_TXT"] = df.apply(stock_text, axis=1)
+    return df
+
+@st.cache_data(ttl=180, show_spinner=False)
+def xref_load_inventory_df(cfg: dict, debug=False) -> pd.DataFrame:
+    xls = xref_excel_from_bytes(_load_xref_bytes(cfg))
+    df_raw = pd.read_excel(xls, sheet_name=XREF_SHEET_INV, header=None)
+    df = xref_finalize_inventory_dataframe(df_raw)
+    if debug:
+        st.sidebar.write("**XRef: Detected inventory columns:**")
+        for c in df.columns: st.sidebar.write(f"- {c}")
+    return df
+
+# ----- Merge sheet loader -----
+def _xref_find_header_row_for_merge(df_raw: pd.DataFrame) -> int:
+    def is_brandish(v: str) -> bool:
+        v = str(v).strip()
+        if v == "" or v.lower() == "nan": return False
+        letters = sum(ch.isalpha() for ch in v)
+        digits  = sum(ch.isdigit() for ch in v)
+        return letters >= 2 and letters >= digits and len(v) <= 30
+    for i in range(min(50, len(df_raw))):
+        row = df_raw.iloc[i].tolist()
+        nonblank = [x for x in row if str(x).strip() not in {"", "nan", "None"}]
+        brandish = sum(is_brandish(x) for x in row)
+        if len(nonblank) >= 3 and brandish >= 2: return i
+    return 0
+
+_XREF_SPLIT_RE = re.compile(r"[;,/\n]+")
+
+@st.cache_data(ttl=180, show_spinner=False)
+def xref_load_merge_wide_and_long(cfg: dict, debug=False):
+    xls = xref_excel_from_bytes(_load_xref_bytes(cfg))
+    df_raw = pd.read_excel(xls, sheet_name=XREF_SHEET_MERGE, header=None)
+
+    hdr_idx = _xref_find_header_row_for_merge(df_raw)
+    raw_headers = df_raw.iloc[hdr_idx].tolist()
+    headers, seen = [], {}
+    for j, v in enumerate(raw_headers):
+        name = str(v).strip() or f"Col_{j}"
+        if name in seen:
+            seen[name]+=1; name=f"{name}.{seen[name]}"
+        else:
+            seen[name]=0
+        headers.append(name)
+
+    merge_df = df_raw.iloc[hdr_idx+1:].copy()
+    merge_df.columns = headers
+    merge_df = merge_df.reset_index(drop=True)
+
+    for c in merge_df.columns:
+        if merge_df[c].dtype == object:
+            merge_df[c] = merge_df[c].astype(str).str.strip()
+    keep = merge_df.columns[merge_df.apply(lambda s: s.astype(str).str.strip().ne("").any())]
+    merge_df = merge_df[keep]
+
+    if debug:
+        st.sidebar.write("**XRef: Detected MERGE brands:**")
+        for c in merge_df.columns: st.sidebar.write(f"- {c}")
+
+    wide = merge_df.reset_index().rename(columns={"index":"RowID"})
+    parts = []
+    for _, row in wide.iterrows():
+        rid = int(row["RowID"])
+        for brand in wide.columns:
+            if brand == "RowID": continue
+            raw_val = str(row[brand]).strip()
+            if raw_val and raw_val.lower() != "nan":
+                for piece in _XREF_SPLIT_RE.split(raw_val):
+                    piece = piece.strip()
+                    if piece:
+                        parts.append((rid, brand, piece))
+    long = pd.DataFrame(parts, columns=["RowID","Brand","PartNumber"])
+    if long.empty:
+        long = pd.DataFrame(columns=["RowID","Brand","PartNumber"])
+
+    # normalized match keys
+    long["PN_Full"]   = long["PartNumber"].map(xref_normalize_pn)
+    long["PN_Tail"]   = long["PartNumber"].map(xref_last_token_with_digits).map(xref_normalize_pn)
+    long["PN_Digits"] = long["PartNumber"].map(xref_digits_only)
+
+    return merge_df, long
+
+# ----- Resolve + build + inventory match -----
+def _xref_apply_brand_priority(df_hits: pd.DataFrame) -> pd.DataFrame:
+    if df_hits.empty or not XREF_BRAND_PRIORITY:
+        return df_hits
+    prio = {b.upper(): i for i, b in enumerate(XREF_BRAND_PRIORITY)}
+    return df_hits.assign(_p=df_hits["Brand"].str.upper().map(prio).fillna(999)) \
+                  .sort_values(by=["_p","PartNumber","RowID"]).drop(columns="_p")
+
+def xref_resolve_rowset_and_primary_brand(query: str, long_df: pd.DataFrame):
+    q_full   = xref_normalize_pn(query)
+    q_tail   = xref_normalize_pn(xref_last_token_with_digits(query))
+    q_digits = xref_digits_only(query)
+
+    buckets = []
+    buckets.append(long_df[long_df["PN_Full"] == q_full])
+    if q_tail and len(q_tail) >= 5:
+        buckets.append(long_df[long_df["PN_Tail"] == q_tail])
+    if q_digits and len(q_digits) >= 5:
+        buckets.append(long_df[long_df["PN_Digits"] == q_digits])
+
+    for cand in buckets:
+        if not cand.empty:
+            row_ids = set(cand["RowID"].astype(int).tolist())
+            c = _xref_apply_brand_priority(cand).assign(_len=cand["PartNumber"].astype(str).str.len())
+            best = c.sort_values(by=["_len","RowID"]).iloc[0]
+            return row_ids, str(best["Brand"])
+    return set(), None
+
+def xref_build_crossrefs_from_rows(merge_df: pd.DataFrame, row_ids: set) -> pd.DataFrame:
+    if not row_ids:
+        return pd.DataFrame(columns=["Brand","PartNumber","PN_Norm"])
+    frames = []
+    for rid in sorted(row_ids):
+        row = merge_df.loc[rid]
+        items = []
+        for brand in merge_df.columns:
+            val = str(row[brand]).strip()
+            if val and val.lower()!="nan":
+                items.append({"Brand":brand,"PartNumber":val,"PN_Norm":xref_normalize_pn(val)})
+        if items:
+            frames.append(pd.DataFrame(items))
+    xrefs = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame(columns=["Brand","PartNumber","PN_Norm"])
+    if xrefs.empty:
+        return xrefs
+    prio = {b.upper(): i for i, b in enumerate(XREF_BRAND_PRIORITY)}
+    xrefs["_p"] = xrefs["Brand"].str.upper().map(prio).fillna(999)
+    xrefs = (xrefs.sort_values(by=["PN_Norm","_p","PartNumber"])
+                   .drop_duplicates(subset=["PN_Norm"], keep="first")
+                   .drop(columns="_p")
+                   .reset_index(drop=True))
+    return xrefs
+
+def xref_add_entered_pn_to_xrefs(xrefs: pd.DataFrame, pn_input: str, matched_brand: str|None) -> pd.DataFrame:
+    pn_norm = xref_normalize_pn(pn_input)
+    if pn_norm and pn_norm not in set(xrefs["PN_Norm"]):
+        brand = matched_brand if matched_brand else "Entered PN"
+        extra = pd.DataFrame([{"Brand":brand,"PartNumber":pn_input,"PN_Norm":pn_norm}])
+        xrefs = pd.concat([extra, xrefs], ignore_index=True)
+    return xrefs
+
+def xref_inventory_lookup_per_xref(inv_df: pd.DataFrame, cross_df: pd.DataFrame, location2: str|None) -> pd.DataFrame:
+    df = inv_df.copy()
+
+    # Filters: Location2 + in-stock only
+    if location2 and XREF_INV_COL_LOC2 in df.columns:
+        loc_norm = xref_norm_text(location2)
+        df = df[df[XREF_INV_COL_LOC2].map(xref_norm_text) == loc_norm]
+    if XREF_INV_COL_QTY in df.columns:
+        df[XREF_INV_COL_QTY] = pd.to_numeric(df[XREF_INV_COL_QTY], errors="coerce").fillna(0)
+        df = df[df[XREF_INV_COL_QTY] > 0]
+
+    def S(col: str) -> pd.Series:
+        return df[col] if col in df.columns else pd.Series([""]*len(df), index=df.index)
+
+    hits_all = []
+
+    for _, xr in cross_df.iterrows():
+        brand = str(xr.get("Brand","")).strip()
+        pn    = str(xr.get("PartNumber","")).strip()
+        if not pn:
+            continue
+
+        pn_norm   = xref_normalize_pn(pn)
+        tail_norm = xref_normalize_pn(xref_last_token_with_digits(pn))
+        dig       = xref_digits_only(pn)
+        brand_pn  = xref_normalize_pn(f"{brand} {pn}") if brand else ""
+
+        m = pd.Series(False, index=df.index)
+
+        # Exact on PN / Name
+        m = m | (S("_PN_NORM")  == pn_norm) | (S("_NAME_NORM")  == pn_norm)
+
+        # Exact on "Brand + PN"
+        if brand_pn:
+            m = m | (S("_PN_NORM") == brand_pn) | (S("_NAME_NORM") == brand_pn)
+
+        # Exact tail + ends-with tail
+        if tail_norm and len(tail_norm) >= 5:
+            m = m | (S("_PN_TAIL") == tail_norm) | (S("_NAME_TAIL") == tail_norm)
+            m = m | S("_PN_NORM").astype(str).str.endswith(tail_norm, na=False)
+            m = m | S("_NAME_NORM").astype(str).str.endswith(tail_norm, na=False)
+
+        # Exact digits + ends-with digits
+        if len(dig) >= 5:
+            m = m | (S("_PN_DIG") == dig) | (S("_NAME_DIG") == dig)
+            m = m | S("_PN_DIG").astype(str).str.endswith(dig, na=False)
+            m = m | S("_NAME_DIG").astype(str).str.endswith(dig, na=False)
+
+        matched = df.loc[m].copy()
+        if matched.empty:
+            continue
+
+        # Prepare output (preserve location detail)
+        show_cols = []
+        if XREF_INV_COL_PN in matched.columns:   show_cols.append(XREF_INV_COL_PN)
+        if XREF_INV_COL_NAME in matched.columns: show_cols.append(XREF_INV_COL_NAME)
+        for c in (XREF_INV_COL_LOC2, XREF_INV_COL_LOC, XREF_INV_COL_AREA, XREF_INV_COL_QTY):
+            if c in matched.columns: show_cols.append(c)
+        show_cols += ["_STOCK_TXT","_ROWID"]
+        show_cols = [c for c in show_cols if c in matched.columns]
+
+        out = matched[show_cols].rename(columns={
+            XREF_INV_COL_PN:   "Inventory PN",
+            XREF_INV_COL_NAME: "Name",
+            XREF_INV_COL_QTY:  "Qty",
+            "_STOCK_TXT":      "Stock"
+        })
+        out.insert(0, "Matched PN", pn)
+        out.insert(0, "Matched Brand", brand)
+        hits_all.append(out)
+
+    if not hits_all:
+        return pd.DataFrame(columns=["Matched From","Inventory PN","Name","Location2","Location","Area","Qty","Stock"])
+
+    result = pd.concat(hits_all, ignore_index=True)
+    result["Matched Pair"] = (result.get("Matched Brand","").astype(str) + " " + result.get("Matched PN","").astype(str)).str.strip()
+
+    # Aggregate **per inventory row** (_ROWID) so duplicates by location remain separate
+    group_keys = ["_ROWID"]
+    keep_cols = [c for c in ["Inventory PN","Name","Location2","Location","Area","Qty","Stock"] if c in result.columns]
+    agg = result.groupby(group_keys, as_index=False).agg(**{
+        "Matched From": ("Matched Pair", lambda s: ", ".join(sorted({x for x in s if x})))
+    })
+    static = result.drop_duplicates("_ROWID")[["_ROWID"] + keep_cols]
+    merged = pd.merge(agg, static, on="_ROWID", how="left").drop(columns=["_ROWID"])
+
+    order = [c for c in ["Matched From","Inventory PN","Name","Location2","Location","Area","Qty","Stock"] if c in merged.columns]
+    merged = merged[order]
+
+    sort_cols = [c for c in ["Inventory PN","Name","Location2","Location","Area"] if c in merged.columns]
+    return merged.sort_values(by=sort_cols).reset_index(drop=True)
+
+
+
 # ---------- fast I/O / Parquet layer ----------
 PARQUET_DIR = Path("faststore")
 PARQUET_DIR.mkdir(exist_ok=True)
@@ -480,11 +860,13 @@ else:
         st.cache_data.clear()
         st.rerun()
 
-    page = st.sidebar.radio(
-        "Page",
-        ["🔎 Asset History", "📋 Work Orders", "🧾 Service Report", "📚 Service History"],
-        index=1
-    )
+   page = st.sidebar.radio(
+    "Page",
+    ["🔎 Asset History", "📋 Work Orders", "🧾 Service Report", "📚 Service History", "🔁 Cross Reference"],
+    index=1
+)
+
+
 
     # Load workbook bytes + expose Parquet cache tools
     xlsx_path = _xlsx_path_from_cfg(cfg)
@@ -705,6 +1087,70 @@ else:
                                file_name=f"WorkOrders_{view.replace(' ','_')}.docx",
                                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
         st.stop()
+
+
+# ========= Cross Reference =========
+if page == "🔁 Cross Reference":
+    st.markdown("### Cross-Reference Finder")
+
+    xref_debug = st.sidebar.checkbox("XRef: show detected headers", value=False)
+
+    # Load local workbook (no GitHub/secrets)
+    try:
+        inv_df = xref_load_inventory_df(cfg, debug=xref_debug)
+        merge_df, long_df = xref_load_merge_wide_and_long(cfg, debug=xref_debug)
+    except Exception as e:
+        st.error(f"Cross-Reference: failed to read local file: {e}")
+        st.stop()
+
+    # Optional Location2 filter (from inventory)
+    loc_options = []
+    if XREF_INV_COL_LOC2 in inv_df.columns:
+        loc_options = sorted(inv_df[XREF_INV_COL_LOC2].dropna().astype(str).unique().tolist())
+    use_loc = st.sidebar.checkbox("Filter by a specific Location2", value=True)
+    sel_loc2 = st.sidebar.selectbox("Location2", options=loc_options, index=0) if use_loc and loc_options else None
+
+    pn_input = st.text_input("Enter a part number (any brand)", value="", placeholder="e.g., 1R-0716 or P554005")
+    if st.button("Find"):
+        if not pn_input.strip():
+            st.warning("Please enter a part number."); st.stop()
+
+        # 1) Resolve rowset + primary brand
+        row_ids, primary_brand = xref_resolve_rowset_and_primary_brand(pn_input, long_df)
+        if not row_ids:
+            st.error("No cross-reference row found for that part number.")
+            st.stop()
+
+        # 2) Build xrefs from those rows
+        xrefs = xref_build_crossrefs_from_rows(merge_df, row_ids)
+
+        # 3) Show detected manufacturer and place that brand first (if any)
+        if primary_brand:
+            st.markdown(f"**Manufacturer detected:** {primary_brand}")
+            xrefs = pd.concat(
+                [xrefs[xrefs["Brand"] == primary_brand], xrefs[xrefs["Brand"] != primary_brand]],
+                ignore_index=True
+            )
+        else:
+            st.markdown("**Manufacturer detected:** _Unknown_")
+
+        # 4) Ensure the exact typed PN is included for stock search
+        xrefs = xref_add_entered_pn_to_xrefs(xrefs, pn_input, primary_brand)
+
+        # 5) Show cross-refs
+        st.subheader("Cross-References")
+        st.dataframe(xrefs[["Brand","PartNumber"]], use_container_width=True)
+
+        # 6) Per-xref inventory search; aggregate per inventory row (_ROWID)
+        st.subheader("Inventory matches")
+        hits = xref_inventory_lookup_per_xref(inv_df, xrefs, sel_loc2 if use_loc else None)
+        if hits.empty:
+            st.info("No stock at the selected Location2 for any cross references." if use_loc else "No stock found for any cross references.")
+        else:
+            st.dataframe(hits, use_container_width=True)
+
+    st.stop()
+
 
     # ========= Service Report =========
     if page == "🧾 Service Report":
