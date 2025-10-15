@@ -860,7 +860,7 @@ else:
         st.cache_data.clear()
         st.rerun()
 
-      page = st.sidebar.radio(
+    page = st.sidebar.radio(
         "Page",
         ["🔎 Asset History", "📋 Work Orders", "🧾 Service Report", "📚 Service History", "🔁 Cross Reference"],
         index=1
