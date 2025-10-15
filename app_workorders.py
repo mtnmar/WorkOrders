@@ -1,9 +1,10 @@
 # app_workorders.py — Parquet fast-path drop‑in
 # --------------------------------------------------------------
 # SPF Work Orders (reads local Workorders.xlsx by default; Parquet cache)
-# Pages: Asset History • Work Orders • Service Report • Service History
+# Pages: Asset History • Work Orders • Cross Reference • Service Report • Service History
 # Privacy-safe by Location; Dates normalized; “Data last updated” (ET)
 # Requires: pandas, pyarrow, xlsxwriter, streamlit-authenticator, openpyxl
+# (Optional) python-docx for Word exports from app buttons
 # --------------------------------------------------------------
 
 from __future__ import annotations
@@ -16,7 +17,7 @@ import pandas as pd
 import streamlit as st
 import yaml
 
-APP_VERSION = "2025.10.15p2"
+APP_VERSION = "2025.10.15p3"
 
 # ---------- small CSS: hide Streamlit chrome / shrink controls ----------
 st.set_page_config(page_title="SPF Work Orders", page_icon="🧰", layout="wide")
@@ -862,11 +863,9 @@ else:
 
     page = st.sidebar.radio(
         "Page",
-        ["🔎 Asset History", "📋 Work Orders", "🧾 Service Report", "📚 Service History", "🔁 Cross Reference"],
+        ["🔎 Asset History", "📋 Work Orders", "🔁 Cross Reference", "🧾 Service Report", "📚 Service History"],
         index=1
     )
-
-
 
     # Load workbook bytes + expose Parquet cache tools
     xlsx_path = _xlsx_path_from_cfg(cfg)
@@ -1090,65 +1089,63 @@ else:
 
     # ========= Cross Reference =========
     if page == "🔁 Cross Reference":
-    st.markdown("### Cross-Reference Finder")
+        st.markdown("### Cross-Reference Finder")
+        xref_debug = st.sidebar.checkbox("XRef: show detected headers", value=False)
 
-    xref_debug = st.sidebar.checkbox("XRef: show detected headers", value=False)
-
-    # Load local workbook (no GitHub/secrets)
-    try:
-        inv_df = xref_load_inventory_df(cfg, debug=xref_debug)
-        merge_df, long_df = xref_load_merge_wide_and_long(cfg, debug=xref_debug)
-    except Exception as e:
-        st.error(f"Cross-Reference: failed to read local file: {e}")
-        st.stop()
-
-    # Optional Location2 filter (from inventory)
-    loc_options = []
-    if XREF_INV_COL_LOC2 in inv_df.columns:
-        loc_options = sorted(inv_df[XREF_INV_COL_LOC2].dropna().astype(str).unique().tolist())
-    use_loc = st.sidebar.checkbox("Filter by a specific Location2", value=True)
-    sel_loc2 = st.sidebar.selectbox("Location2", options=loc_options, index=0) if use_loc and loc_options else None
-
-    pn_input = st.text_input("Enter a part number (any brand)", value="", placeholder="e.g., 1R-0716 or P554005")
-    if st.button("Find"):
-        if not pn_input.strip():
-            st.warning("Please enter a part number."); st.stop()
-
-        # 1) Resolve rowset + primary brand
-        row_ids, primary_brand = xref_resolve_rowset_and_primary_brand(pn_input, long_df)
-        if not row_ids:
-            st.error("No cross-reference row found for that part number.")
+        # Load local workbook (no GitHub/secrets)
+        try:
+            inv_df = xref_load_inventory_df(cfg, debug=xref_debug)
+            merge_df, long_df = xref_load_merge_wide_and_long(cfg, debug=xref_debug)
+        except Exception as e:
+            st.error(f"Cross-Reference: failed to read local file: {e}")
             st.stop()
 
-        # 2) Build xrefs from those rows
-        xrefs = xref_build_crossrefs_from_rows(merge_df, row_ids)
+        # Optional Location2 filter (from inventory)
+        loc_options = []
+        if XREF_INV_COL_LOC2 in inv_df.columns:
+            loc_options = sorted(inv_df[XREF_INV_COL_LOC2].dropna().astype(str).unique().tolist())
+        use_loc = st.sidebar.checkbox("Filter by a specific Location2", value=True)
+        sel_loc2 = st.sidebar.selectbox("Location2", options=loc_options, index=0) if use_loc and loc_options else None
 
-        # 3) Show detected manufacturer and place that brand first (if any)
-        if primary_brand:
-            st.markdown(f"**Manufacturer detected:** {primary_brand}")
-            xrefs = pd.concat(
-                [xrefs[xrefs["Brand"] == primary_brand], xrefs[xrefs["Brand"] != primary_brand]],
-                ignore_index=True
-            )
-        else:
-            st.markdown("**Manufacturer detected:** _Unknown_")
+        pn_input = st.text_input("Enter a part number (any brand)", value="", placeholder="e.g., 1R-0716 or P554005")
+        if st.button("Find"):
+            if not pn_input.strip():
+                st.warning("Please enter a part number."); st.stop()
 
-        # 4) Ensure the exact typed PN is included for stock search
-        xrefs = xref_add_entered_pn_to_xrefs(xrefs, pn_input, primary_brand)
+            # 1) Resolve rowset + primary brand
+            row_ids, primary_brand = xref_resolve_rowset_and_primary_brand(pn_input, long_df)
+            if not row_ids:
+                st.error("No cross-reference row found for that part number.")
+                st.stop()
 
-        # 5) Show cross-refs
-        st.subheader("Cross-References")
-        st.dataframe(xrefs[["Brand","PartNumber"]], use_container_width=True)
+            # 2) Build xrefs from those rows
+            xrefs = xref_build_crossrefs_from_rows(merge_df, row_ids)
 
-        # 6) Per-xref inventory search; aggregate per inventory row (_ROWID)
-        st.subheader("Inventory matches")
-        hits = xref_inventory_lookup_per_xref(inv_df, xrefs, sel_loc2 if use_loc else None)
-        if hits.empty:
-            st.info("No stock at the selected Location2 for any cross references." if use_loc else "No stock found for any cross references.")
-        else:
-            st.dataframe(hits, use_container_width=True)
+            # 3) Show detected manufacturer and place that brand first (if any)
+            if primary_brand:
+                st.markdown(f"**Manufacturer detected:** {primary_brand}")
+                xrefs = pd.concat(
+                    [xrefs[xrefs["Brand"] == primary_brand], xrefs[xrefs["Brand"] != primary_brand]],
+                    ignore_index=True
+                )
+            else:
+                st.markdown("**Manufacturer detected:** _Unknown_")
 
-    st.stop()
+            # 4) Ensure the exact typed PN is included for stock search
+            xrefs = xref_add_entered_pn_to_xrefs(xrefs, pn_input, primary_brand)
+
+            # 5) Show cross-refs
+            st.subheader("Cross-References")
+            st.dataframe(xrefs[["Brand","PartNumber"]], use_container_width=True)
+
+            # 6) Per-xref inventory search; aggregate per inventory row (_ROWID)
+            st.subheader("Inventory matches")
+            hits = xref_inventory_lookup_per_xref(inv_df, xrefs, sel_loc2 if use_loc else None)
+            if hits.empty:
+                st.info("No stock at the selected Location2 for any cross references." if use_loc else "No stock found for any cross references.")
+            else:
+                st.dataframe(hits, use_container_width=True)
+        st.stop()
 
     # ========= Service Report =========
     if page == "🧾 Service Report":
@@ -1365,7 +1362,6 @@ else:
                 mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
             )
         st.stop()
-
 
 
 
