@@ -1,14 +1,14 @@
-# app_workorders.py — Parquet fast-path drop‑in + CrossRef + Service Procedures (GitHub)
+# app_workorders.py — Parquet fast-path drop‑in + CrossRef + Service Procedures (LOCAL)
 # --------------------------------------------------------------
 # SPF Work Orders (reads local Workorders.xlsx by default; Parquet cache)
 # Pages: Asset History • Work Orders • Cross Reference • Service Report • Service History • Service Procedure Filter
 # Privacy-safe by Location; Dates normalized; “Data last updated” (ET)
-# Requires: pandas, pyarrow, xlsxwriter, streamlit-authenticator, openpyxl, requests
+# Requires: pandas, pyarrow, xlsxwriter, streamlit-authenticator, openpyxl
 # (Optional) python-docx for Word exports from app buttons
 # --------------------------------------------------------------
 
 from __future__ import annotations
-import io, re, os, base64, time, platform, tempfile
+import io, re, os, time, platform, tempfile
 from urllib.parse import quote
 from pathlib import Path
 from collections.abc import Mapping
@@ -17,9 +17,8 @@ from datetime import datetime, timedelta, timezone
 import pandas as pd
 import streamlit as st
 import yaml
-import requests
 
-APP_VERSION = "2025.10.15p4"
+APP_VERSION = "2025.10.15p5-local"
 
 # ---------- small CSS: hide Streamlit chrome / shrink controls ----------
 st.set_page_config(page_title="SPF Work Orders", page_icon="🧰", layout="wide")
@@ -830,8 +829,8 @@ def load_users_sheet(xlsx_mtime: float, xlsx_path_str: str) -> list[str] | None:
             pass
     return None
 
-# ---------- Service Procedure Filter (GitHub-backed) — page function ----------
-def render_service_procedure_page():
+# ---------- Service Procedure Filter (LOCAL workbook) — page function ----------
+def render_service_procedure_page(xmtime: float, xlsx_path_str: str):
     st.markdown("### Service Procedure Filter")
     # ---------- Optional Word export ----------
     try:
@@ -845,20 +844,6 @@ def render_service_procedure_page():
         DOCX_AVAILABLE = False
 
     SHOW_PRINT = (platform.system() == "Windows") and (os.environ.get("ALLOW_SERVER_PRINT") == "1")
-
-    # ---------- REQUIRED SECRETS ----------
-    GH_OWNER  = st.secrets.get("GH_OWNER")
-    GH_REPO   = st.secrets.get("GH_REPO")
-    GH_BRANCH = st.secrets.get("GH_BRANCH", "main")
-    GH_PATH   = st.secrets.get("GH_WORKBOOK_PATH")
-    GH_TOKEN  = st.secrets.get("GH_TOKEN", "")
-
-    if not GH_OWNER or not GH_REPO or not GH_PATH:
-        st.error(
-            "Missing secrets. Please set GH_OWNER, GH_REPO, GH_WORKBOOK_PATH "
-            "(and GH_TOKEN if the repo is private) in Streamlit secrets."
-        )
-        st.stop()
 
     # ---------- Sheet / Column names ----------
     SHEET_PROC     = "Service Procedures"
@@ -890,93 +875,30 @@ def render_service_procedure_page():
         "Item Description", "Product Name"
     ]
 
-    # ---------- GitHub fetch ----------
-    def _gh_headers_json():
-        hdrs = {"Accept": "application/vnd.github+json"}
-        if GH_TOKEN:
-            hdrs["Authorization"] = f"Bearer {GH_TOKEN}"
-        return hdrs
-
-    @st.cache_data(ttl=120, show_spinner=False)
-    def fetch_workbook_bytes(owner: str, repo: str, branch: str, path: str) -> bytes:
-        url = f"https://api.github.com/repos/{owner}/{repo}/contents/{quote(path)}"
-        params = {"ref": branch}
-        r = requests.get(url, headers=_gh_headers_json(), params=params, timeout=30)
-        if r.status_code != 200:
-            raise RuntimeError(
-                f"GitHub error {r.status_code} fetching {owner}/{repo}:{path}@{branch}\n"
-                f"{r.text[:400]}"
-            )
-        data = r.json()
-        if isinstance(data, dict):
-            if "content" in data and data.get("encoding") == "base64":
-                try:
-                    return base64.b64decode(data["content"])
-                except Exception as e:
-                    raise RuntimeError(f"Failed to decode base64 content: {e}") from e
-            if "download_url" in data and data["download_url"]:
-                rr = requests.get(data["download_url"], timeout=60)
-                rr.raise_for_status()
-                return rr.content
-        raise RuntimeError(
-            f"Unexpected GitHub response for path '{path}'. "
-            f"Is it a file (not a folder)? Keys: {list(data)[:10]}"
-        )
-
-    def load_xls_from_bytes(b: bytes) -> pd.ExcelFile:
-        return pd.ExcelFile(io.BytesIO(b), engine="openpyxl")
-
-    def read_sheet(xls: pd.ExcelFile, sheet: str) -> pd.DataFrame:
-        df = pd.read_excel(xls, sheet_name=sheet)
+    # ---------- Cached local sheet reader ----------
+    xlsx_path = Path(xlsx_path_str)
+    def read_sheet_cached(sheet: str) -> pd.DataFrame:
+        if _parquet_fresh(sheet, xlsx_path):
+            df = _read_parquet_columns(sheet, columns=None)
+        else:
+            _rebuild_parquet_from_excel(get_local_xlsx_bytes_cached(xlsx_path_str, xmtime), [sheet])
+            df = _read_parquet_columns(sheet, columns=None)
+        # de-duplicate any repeated column names
         return df.loc[:, ~pd.Index(df.columns).duplicated(keep="first")]
 
-    # ---------- Domain helpers ----------
-    def normalize_pn(pn):
-        """Uppercase, remove all non-alphanumerics (makes hyphens, spaces, dots irrelevant)."""
-        if pd.isna(pn): return ""
-        return "".join(ch for ch in str(pn).upper() if ch.isalnum())
-
-    _SPLIT_RE = re.compile(r"[,\;/\s]+")
-
-    def _token_norms_from_text(s: str):
-        """
-        Produce PN-like tokens from free text by splitting on comma/semicolon/slash/space,
-        then normalizing each token (hyphens/spaces removed), keeping only tokens that contain a digit.
-        """
-        if s is None: return []
-        toks = []
-        for piece in _SPLIT_RE.split(str(s).upper()):
-            piece = piece.strip()
-            if not piece:
-                continue
-            n = normalize_pn(piece)
-            if n and any(ch.isdigit() for ch in n):
-                toks.append(n)
-        return toks
-
-    def _semi_join(tokens):
-        # Build ;T1;T2; string for exact token membership checks (Excel-like)
-        uniq, seen = [], set()
-        for t in tokens:
-            if t not in seen:
-                uniq.append(t); seen.add(t)
-        return ";" + ";".join(uniq) + ";" if uniq else ";"
-
-    # ---------- Load workbook ----------
+    # ---------- Load workbook (LOCAL) ----------
     try:
-        wb_bytes = fetch_workbook_bytes(GH_OWNER, GH_REPO, GH_BRANCH, GH_PATH)
-        xls = load_xls_from_bytes(wb_bytes)
-        df_proc = read_sheet(xls, SHEET_PROC)
-        df_ctrl = read_sheet(xls, SHEET_CTRL)
-        df_inv  = read_sheet(xls, SHEET_INV)
-        df_xref = read_sheet(xls, SHEET_XREF) if SHEET_XREF in xls.sheet_names else pd.DataFrame()
+        df_proc = read_sheet_cached(SHEET_PROC)
+        df_ctrl = read_sheet_cached(SHEET_CTRL)
+        df_inv  = read_sheet_cached(SHEET_INV)
+        df_xref = read_sheet_cached(SHEET_XREF) if _parquet_fresh(SHEET_XREF, xlsx_path) or True else pd.DataFrame()
     except Exception as e:
-        st.error(f"Error loading workbook from GitHub: {e}")
+        st.error(f"Error loading workbook from local file: {e}")
         st.stop()
 
     with st.sidebar:
-        st.caption(f"Workbook source: {GH_OWNER}/{GH_REPO}@{GH_BRANCH} • {GH_PATH}")
-        if st.button("Reload GitHub workbook"):
+        st.caption(f"Workbook source: {xlsx_path.resolve()}")
+        if st.button("Reload local workbook"):
             st.cache_data.clear()
             st.rerun()
 
@@ -1002,6 +924,36 @@ def render_service_procedure_page():
             return ""
         # remove NBSPs/tabs and trim
         return str(s).replace("\u00A0", "").replace("\t", "").strip()
+
+    _SPLIT_RE = re.compile(r"[,\;/\s]+")
+    def normalize_pn(pn):
+        """Uppercase, remove all non-alphanumerics (makes hyphens, spaces, dots irrelevant)."""
+        if pd.isna(pn): return ""
+        return "".join(ch for ch in str(pn).upper() if ch.isalnum())
+
+    def _token_norms_from_text(s: str):
+        """
+        Produce PN-like tokens from free text by splitting on comma/semicolon/slash/space,
+        then normalizing each token (hyphens/spaces removed), keeping only tokens that contain a digit.
+        """
+        if s is None: return []
+        toks = []
+        for piece in _SPLIT_RE.split(str(s).upper()):
+            piece = piece.strip()
+            if not piece:
+                continue
+            n = normalize_pn(piece)
+            if n and any(ch.isdigit() for ch in n):
+                toks.append(n)
+        return toks
+
+    def _semi_join(tokens):
+        # Build ;T1;T2; string for exact token membership checks (Excel-like)
+        uniq, seen = [], set()
+        for t in tokens:
+            if t not in seen:
+                uniq.append(t); seen.add(t)
+        return ";" + ";".join(uniq) + ";" if uniq else ";"
 
     def _build_tok_name(row) -> str:
         if not inv_name_col:
@@ -1230,6 +1182,11 @@ def render_service_procedure_page():
             st.stop()
 
         result = unpivot_to_task_then_parts(proc_filt)
+
+        # build PN normalization for matching
+        def normalize_pn(pn):
+            if pd.isna(pn): return ""
+            return "".join(ch for ch in str(pn).upper() if ch.isalnum())
         result["_PN_NORM"] = result["Part Number"].apply(normalize_pn)
 
         # ---- CAT → Donaldson cross reference ----
@@ -1862,6 +1819,5 @@ else:
 
     # ========= Service Procedure Filter =========
     if page == "🧰 Service Procedure Filter":
-        render_service_procedure_page()
+        render_service_procedure_page(xmtime, str(xlsx_path))
         st.stop()
-
